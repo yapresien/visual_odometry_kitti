@@ -1,13 +1,25 @@
 import os, glob, cv2, numpy as np, time
 from scipy.spatial import cKDTree
 
+import vo_config as cfg
+
+# Environment overrides for testing (no effect on normal runs)
+_env_max = os.environ.get("VO_MAX_FRAMES")
+if _env_max:
+    MAX_FRAMES = int(_env_max)
+OUTPUT_PATH = os.environ.get("VO_OUTPUT", "est_traj.txt")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # GPU vs CPU FLAGS
 # ═══════════════════════════════════════════════════════════════════════════
-USE_GPU_DETECTOR = False
-USE_GPU_SGBM     = False
-USE_GPU_LK       = False
+USE_GPU_DETECTOR = True
+USE_GPU_SGBM     = True
+USE_GPU_LK       = True
+
+if os.environ.get("VO_FORCE_CPU"):
+    USE_GPU_DETECTOR = USE_GPU_SGBM = USE_GPU_LK = False
+
 ANY_GPU = USE_GPU_DETECTOR or USE_GPU_SGBM or USE_GPU_LK
 
 
@@ -25,32 +37,31 @@ RENDER_EVERY_N = 1        # 1 = every frame; 5 = skip 4 (faster, fewer visuals)
 # ═══════════════════════════════════════════════════════════════════════════
 # ACCURACY CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
-NUM_DISP        = 128
-P1_SGBM         = 200
-P2_SGBM         = 400
-UNIQUENESS      = 3
-BLOCK_SIZE      = 5
-LK_WIN          = (21, 21)
-LK_LEVELS       = 4
-LK_ITERS        = 40
-LK_EPS          = 0.01
-Z_MIN           = 3.0
-Z_MAX           = 200.0
-RANSAC_ITERS    = 300
-RANSAC_REPROJ   = 3.5
-RANSAC_CONF     = 0.99
-RANSAC_FLAGS    = cv2.SOLVEPNP_SQPNP
-MERGE_THRESHOLD = 15.0
-POOL_MIN_POINTS = 100
+NUM_DISP        = cfg.NUM_DISP
+P1_SGBM         = cfg.P1_SGBM
+P2_SGBM         = cfg.P2_SGBM
+UNIQUENESS      = cfg.UNIQUENESS
+BLOCK_SIZE      = cfg.BLOCK_SIZE
+LK_WIN          = cfg.LK_WIN
+LK_LEVELS       = cfg.LK_LEVELS
+LK_ITERS        = cfg.LK_ITERS
+LK_EPS          = cfg.LK_EPS
+Z_MIN           = cfg.Z_MIN
+Z_MAX           = cfg.Z_MAX
+RANSAC_ITERS    = cfg.RANSAC_ITERS
+RANSAC_REPROJ   = cfg.RANSAC_REPROJ
+RANSAC_CONF     = cfg.RANSAC_CONF
+RANSAC_FLAGS    = cfg.RANSAC_FLAGS
+MERGE_THRESHOLD = cfg.MERGE_THRESHOLD
+POOL_MIN_POINTS = cfg.POOL_MIN_POINTS
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PATHS + CALIB
-# ═══════════════════════════════════════════════════════════════════════════
-BASEDIR       = '/media/master/2tbkup/MySpace/projects/dataset_kiti/sequences/00'
-CALIB_FILE    = os.path.join(BASEDIR, 'calib.txt')
-GT_POSES_FILE = '/media/master/2tbkup/MySpace/projects/dataset_kiti/poses/00.txt'
-
+# ════════════════════════════════════
+BASEDIR       = cfg.BASEDIR
+CALIB_FILE = cfg.CALIB_FILE
+GT_POSES_FILE = cfg.GT_POSES_FILE
 
 def load_kitti_calib(path):
     with open(path) as f:
@@ -301,8 +312,8 @@ try:
 
 finally:
     if traj_log:
-        np.savetxt("est_traj.txt", np.array(traj_log))
-        print(f"[SAVE] {len(traj_log)} rows → est_traj.txt")
+        np.savetxt(OUTPUT_PATH, np.array(traj_log))
+        print(f"[SAVE] {len(traj_log)} rows → {OUTPUT_PATH}")
     cv2.destroyAllWindows()
 
 
