@@ -38,8 +38,8 @@ def rpe(est_poses, gt_poses, delta_m=100):
         r_err.append(np.degrees(np.arccos(np.clip(ca, -1, 1))))
     return np.mean(t_err), np.mean(r_err)
 
-GT  = "/media/master/2tbkup/MySpace/projects/dataset_kiti/poses/00.txt"
-EST = "/media/master/2tbkup/MySpace/projects/visual_odometry_kitti/est_traj.txt"
+GT  = "/home/master/myspace/projects/dataset_kitti/poses/00.txt"
+EST = "/home/master/myspace/projects/visual_odometry_kitti/est_traj.txt"
 
 gt = load_poses(GT); 
 est = load_poses(EST)

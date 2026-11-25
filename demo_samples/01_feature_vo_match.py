@@ -7,7 +7,7 @@ min_features_needed = 1000
 detector = cv2.ORB_create(nfeatures=3000)
 bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-basedir = '/media/master/2tbkup/MySpace/projects/dataset_kiti'
+basedir = '/home/master/myspace/projects/dataset_kitti'
 
 # Specify the dataset to load
 sequence = '00'

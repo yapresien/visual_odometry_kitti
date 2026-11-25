@@ -38,7 +38,7 @@ def load_kitti_calib(calib_file_path):
 # =========================================================================
 # 2. FILE PATH AND INITIALIZATION SETUP
 # =========================================================================
-basedir = '/media/master/2tbkup/MySpace/projects/dataset_kiti/sequences/00'
+basedir = '/home/master/myspace/projects/dataset_kitti/sequences/00'
 image_dir = os.path.join(basedir, 'image_0')
 calib_file = os.path.join(basedir, 'calib.txt')
 

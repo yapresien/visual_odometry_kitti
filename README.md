@@ -241,7 +241,7 @@ random walk averages back toward zero statistically.
 - OpenCV 4.10.0 (CUDA + contrib)
 - NumPy
 - CUDA-capable GPU (~2 GB VRAM)
-- Dataset root: `/media/master/2tbkup/MySpace/projects/dataset_kiti/sequences/00/`
+- Dataset root: `/home/master/myspace/projects/dataset_kitti/sequences/00/`
 
 ### Run
 

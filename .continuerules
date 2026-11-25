@@ -1,0 +1,19 @@
+You are working on C++20 and Python projects.
+
+Always:
+- Prefer RAII
+- Prefer std::jthread
+- Prefer modern CMake
+- Generate unit tests
+- Explain concurrency risks
+- Avoid global state
+- Follow clang-tidy recommendations
+
+For Python:
+- Generate mypy-friendly code
+- Generate pytest tests
+
+For C++:
+- Follow C++20
+- Consider exception safety
+- Consider thread safety

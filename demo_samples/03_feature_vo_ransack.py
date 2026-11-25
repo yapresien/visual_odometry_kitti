@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 # 1. Setup paths
-basedir = '/media/master/2tbkup/MySpace/projects/dataset_kiti'
+basedir = '/home/master/myspace/projects/dataset_kitti'
 sequence = '00'
 seq_dir = os.path.join(basedir, 'sequences', sequence)
 sequence_dir = os.path.join(seq_dir, 'image_0')

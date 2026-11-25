@@ -13,9 +13,9 @@ OUTPUT_PATH = os.environ.get("VO_OUTPUT", "est_traj.txt")
 # ═══════════════════════════════════════════════════════════════════════════
 # GPU vs CPU FLAGS
 # ═══════════════════════════════════════════════════════════════════════════
-USE_GPU_DETECTOR = True
-USE_GPU_SGBM     = True
-USE_GPU_LK       = True
+USE_GPU_DETECTOR = False
+USE_GPU_SGBM     = False
+USE_GPU_LK       = False
 
 if os.environ.get("VO_FORCE_CPU"):
     USE_GPU_DETECTOR = USE_GPU_SGBM = USE_GPU_LK = False

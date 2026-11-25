@@ -1,0 +1,7 @@
+{
+    "cmake.sourceDirectory": "./cpp_demo_samples",
+    "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, ColumnLimit: 9999, BinPackParameters: true, BinPackArguments: true, AllowAllParametersOfDeclarationOnNextLine: true, AllowAllArgumentsOnNextLine: true }",
+    "[cpp]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools"
+    }
+}

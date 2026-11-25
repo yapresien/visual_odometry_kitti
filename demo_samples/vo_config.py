@@ -24,6 +24,6 @@ POOL_MIN_POINTS = 100
 USE_Y_CLAMP     = False            # ← True worsens RPE 2.3% → 5.3%
 
 # Paths
-BASEDIR       = '/media/master/2tbkup/MySpace/projects/dataset_kiti/sequences/00'
+BASEDIR       = '/home/master/myspace/projects/dataset_kitti/sequences/00'
 CALIB_FILE    = os.path.join(BASEDIR, 'calib.txt')
-GT_POSES_FILE = '/media/master/2tbkup/MySpace/projects/dataset_kiti/poses/00.txt'
+GT_POSES_FILE = '/home/master/myspace/projects/dataset_kitti/poses/00.txt'

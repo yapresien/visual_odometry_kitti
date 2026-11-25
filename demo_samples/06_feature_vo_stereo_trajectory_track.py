@@ -41,7 +41,7 @@ def load_kitti_stereo_calib(calib_file_path):
 # =========================================================================
 # 2. FILE PATH AND INITIALIZATION SETUP
 # =========================================================================
-basedir = '/media/master/2tbkup/MySpace/projects/dataset_kiti/sequences/00'
+basedir = '/home/master/myspace/projects/dataset_kitti/sequences/00'
 image0_dir = os.path.join(basedir, 'image_0')
 image1_dir = os.path.join(basedir, 'image_1')
 calib_file = os.path.join(basedir, 'calib.txt')

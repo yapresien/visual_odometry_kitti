@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 # 1. Setup paths (Change this to your actual KITTI path)
-basedir = '/media/master/2tbkup/MySpace/projects/dataset_kiti'
+basedir = '/home/master/myspace/projects/dataset_kitti'
 
 # Specify the dataset to load
 sequence = '00'

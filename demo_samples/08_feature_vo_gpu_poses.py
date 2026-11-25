@@ -32,7 +32,7 @@ def load_kitti_stereo_calib(calib_file_path):
 # =========================================================================
 # 2. PATHS & INITIALIZATION SETUP
 # =========================================================================
-basedir = '/media/master/2tbkup/MySpace/projects/dataset_kiti/sequences/00'
+basedir = '/home/master/myspace/projects/dataset_kitti/sequences/00'
 image0_dir = os.path.join(basedir, 'image_0')
 image1_dir = os.path.join(basedir, 'image_1')
 calib_file = os.path.join(basedir, 'calib.txt')
@@ -53,7 +53,7 @@ print("[DEBUG INIT] Initializing Windows and GPU Device Engine instances...")
 cv2.namedWindow("KITTI Stereo Tracking Stream", cv2.WINDOW_AUTOSIZE)
 cv2.namedWindow("Stereo Trajectory Map", cv2.WINDOW_AUTOSIZE)
 
-gt_poses_file = '/media/master/2tbkup/MySpace/projects/dataset_kiti/poses/00.txt'
+gt_poses_file = '/home/master/myspace/projects/dataset_kitti/poses/00.txt'
 gt_poses = np.loadtxt(gt_poses_file).reshape(-1, 3, 4)
 gt_xyz = gt_poses[:, :, 3]
 print(f"[GT] loaded {len(gt_poses)} poses, "

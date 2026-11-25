@@ -1,9 +1,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-GT_PATH = "/media/master/2tbkup/MySpace/projects/dataset_kiti/poses/00.txt"
-VO_PATH = "/media/master/2tbkup/MySpace/projects/visual_odometry_kitti/est_traj.txt"
-LO_PATH = ("/media/master/2tbkup/MySpace/projects/visual_odometry_kitti/"
+GT_PATH = "/home/master/myspace/projects/dataset_kitti/poses/00.txt"
+VO_PATH = "/home/master/myspace/projects/visual_odometry_kitti/est_traj.txt"
+LO_PATH = ("/home/master/myspace/projects/visual_odometry_kitti/"
            "results/2026-10-30_20-16-42/velodyne_poses_kitti.txt")
 
 def load(p): return np.loadtxt(p).reshape(-1, 3, 4)
