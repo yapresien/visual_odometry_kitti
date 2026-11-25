@@ -80,13 +80,14 @@ class SgbmCpu {
   void preFilter(const std::vector<uint8_t>& src, std::vector<int16_t>& dst, int width, int height) const;
 
   // Stage 2: matching cost (BT / SAD-style block matching per pixel-disparity)
-  void computeCost(const std::vector<int16_t>& left, const std::vector<int16_t>& right, int width, int height, std::vector<int16_t>& cost) const;
-
+  void computeCost(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, const std::vector<int16_t>& sobelLeft, const std::vector<int16_t>& sobelRight, int width, int height, std::vector<int16_t>& cost) const;
+  
   // Stage 3: path aggregation (5 paths: L->R, R->L, T->B, B->T, diagonal)
   void aggregate(const std::vector<int16_t>& cost, int width, int height, std::vector<int32_t>& aggregated) const;
 
   // Stage 4: WTA + uniqueness + subpixel + LR check
   void selectDisparity(const std::vector<int32_t>& aggregated, const std::vector<int16_t>& cost, int width, int height, std::vector<float>& disp) const;
+  void selectRightDisparity(const std::vector<int32_t>& aggL, const std::vector<int16_t>& costL, int width, int height, std::vector<float>& dispR) const;
 
   // Stage 5: left-right consistency check
   void lrCheck(const std::vector<float>& dispRight, int width, int height, std::vector<float>& dispLeft) const;
@@ -105,7 +106,7 @@ public:
         preFilter(src, dst, width, height);
     }
 #endif
-  
+
 };
 
 }  // namespace sgbm
