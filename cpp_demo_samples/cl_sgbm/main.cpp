@@ -12,7 +12,10 @@ int main(int argc, char** argv) {
 
   SgbmOpenClRunner runner(
       {"../kernels/sgbm_prefilter_gfx1102.cl",
-       "../kernels/sgbm_kernels.cl"},
+       "../kernels/sgbm_kernels.cl",
+       "../kernels/sgbm_wta_lrcheck.cl",
+       "../kernels/sgbm_aggregate_dir.cl"
+      },
       width,
       height,
       numDisparities);
@@ -33,6 +36,15 @@ int main(int argc, char** argv) {
   runner.runBoxCost(rawLeft, rawRight, preFilterCap, minDisparity, blockSize, costOut);
   double boxMs = runner.runBoxCost(rawLeft, rawRight, preFilterCap, minDisparity, blockSize, costOut);
   std::cout << "gfx1102 k_bt_box_cost kernel time: " << boxMs << " ms\n";
+
+  const int P1 = 8 * blockSize * blockSize;   // 200 for blockSize = 5
+  const int P2 = 32 * blockSize * blockSize;  // 800 for blockSize = 5
+  std::vector<int32_t> aggOut;
+
+  // Warmup + timed 8-path GPU aggregation
+  runner.runAggregate(P1, P2, aggOut);
+  double aggMs = runner.runAggregate(P1, P2, aggOut);
+  std::cout << "gfx1102 k_sgm_aggregate_dir (8 paths) kernel time: " << aggMs << " ms\n";
 
   return 0;
 }
