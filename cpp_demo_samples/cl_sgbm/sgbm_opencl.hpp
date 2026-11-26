@@ -342,7 +342,7 @@ class SgbmOpenClRunner {
     return btMs + boxMs;
   }
 
-  double runAggregate(int P1, int P2, std::vector<int32_t>& aggOut) {
+  double runAggregate(int P1, int P2, std::vector<uint16_t>& aggOut) {
     struct Dir {
       int dx;
       int dy;
@@ -577,8 +577,10 @@ class SgbmOpenClRunner {
     }
 
     // 5. Stage 4: Left WTA + Right WTA + LR Check
-    const std::array<size_t, 2> wtaLocal = {specs_.sgmWgSize, 1};
-    const std::array<size_t, 2> wtaGlobal = {static_cast<size_t>(width_) * specs_.sgmWgSize, static_cast<size_t>(height_)};
+    const std::array<size_t, 2> wtaLocal = {specs_.sgmWgSize, specs_.costWgH};
+    const std::array<size_t, 2> wtaGlobal = {
+        ((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.sgmWgSize,
+        static_cast<size_t>(height_) * specs_.costWgH };
 
     cl_event evWtaL = nullptr, evWtaR = nullptr, evLr = nullptr;
     CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 0, sizeof(cl_mem), &bufAggL_));
@@ -699,6 +701,7 @@ class SgbmOpenClRunner {
          << "-D COST_WG_W=" << specs.costWgW << " "
          << "-D COST_WG_H=" << specs.costWgH << " "
          << "-D SGM_WG_SIZE=" << specs.sgmWgSize << " "
+         << "-D WTA_ROWS_PER_WG=" << specs.costWgH << " "
          << "-D NUM_DISPARITIES=" << numDisparities << " "
          << "-D D_PER_LANE=" << maxDPerLane << " "
          << "-D MAX_B2=" << (cfg.maxBlockSize / 2) << " "
@@ -781,7 +784,7 @@ class SgbmOpenClRunner {
     const size_t sobelBytes = numPixels_ * sizeof(int16_t);
     const size_t boundsBytes = numPixels_ * sizeof(cl_short2);
     const size_t costVolumeBytes = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(int16_t);
-    const size_t aggVolumeBytes = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(int32_t);
+    const size_t aggVolumeBytes = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(uint16_t);
 
     // Host-uploaded input images
     bufRawL_ = clCreateBuffer(context_, hostReadFlags, rawBytes, nullptr, &err);

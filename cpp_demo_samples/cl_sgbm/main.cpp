@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
 
   const int P1 = 8 * blockSize * blockSize;   // 200 for blockSize = 5
   const int P2 = 32 * blockSize * blockSize;  // 800 for blockSize = 5
-  std::vector<int32_t> aggOut;
+  std::vector<uint16_t> aggOut;
 
   // Warmup + timed 8-path GPU aggregation
   runner.runAggregate(P1, P2, aggOut);

@@ -1,2 +1,8 @@
 build
 cpp_demo_samples/sgbm_cpu/build
+pykitti.egg-info/top_level.txt
+pykitti.egg-info/SOURCES.txt
+pykitti.egg-info/requires.txt
+pykitti.egg-info/PKG-INFO
+pykitti.egg-info/dependency_links.txt
+demo_samples/__pycache__/vo_config.cpython-312.pyc
