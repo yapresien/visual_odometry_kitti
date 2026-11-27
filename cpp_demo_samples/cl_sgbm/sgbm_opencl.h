@@ -137,12 +137,12 @@ class SgbmOpenClRunner {
   // Active OpenCL kernels
   cl_kernel kernelPrefilter_ = nullptr;
   cl_kernel kernelBtPixel_ = nullptr;
-  cl_kernel kernelBoxFilter_ = nullptr;
   cl_kernel kernelAggDir_ = nullptr;
   cl_kernel kernelAggBidiAxis_ = nullptr;
   cl_kernel kernelClearUint_ = nullptr;
   cl_kernel kernelWtaScatter_ = nullptr;
   cl_kernel kernelLrCheck_ = nullptr;
+  cl_kernel kernelBtBoxFused_ = nullptr;
 
   // Active OpenCL device buffers
   cl_mem bufRawL_ = nullptr;

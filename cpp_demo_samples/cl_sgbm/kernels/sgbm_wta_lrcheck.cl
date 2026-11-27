@@ -1,10 +1,12 @@
-// ─── Kernel 4A: Left WTA + Subpixel + Atomic Right-View Scatter (256-Thread WG) ─
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+
+// ─── Kernel 4A (Subgroup-Accelerated WTA + Atomic Right Scatter) ─────────────
 __attribute__((reqd_work_group_size(SGM_WG_SIZE, WTA_ROWS_PER_WG, 1)))
 __kernel void k_wta_subpixel_and_right_scatter(
     __global const ushort* restrict aggIn,
     __global const short* restrict costIn,
     __global float* restrict dispLOut,
-    __global volatile uint* restrict rightMinPacked,  // Initialized to 0xFFFFFFFFu
+    __global volatile uint* restrict rightMinPacked,
     const int width,
     const int height,
     const int minDisparity,
@@ -22,11 +24,9 @@ __kernel void k_wta_subpixel_and_right_scatter(
 
   __local ushort sharedAgg[WTA_ROWS_PER_WG][NUM_DISPARITIES];
   __local short sharedCost[WTA_ROWS_PER_WG][NUM_DISPARITIES];
-  __local int minCostBuf[WTA_ROWS_PER_WG][SGM_WG_SIZE];
-  __local int minDispBuf[WTA_ROWS_PER_WG][SGM_WG_SIZE];
 
-  int localBestC = INT_MAX;
-  int localBestD = -1;
+  // Pack (aggCost << 8) | dIdx so sub_group_reduce_min finds min cost AND breaks ties toward smaller dIdx!
+  int localBestPacked = INT_MAX;
 
   for (int k = 0; k < D_PER_LANE; ++k) {
     const int dIdx = k * SGM_WG_SIZE + lane;
@@ -36,38 +36,25 @@ __kernel void k_wta_subpixel_and_right_scatter(
       sharedCost[sub][dIdx] = c;
       sharedAgg[sub][dIdx] = a;
 
-      if (c != INVALID_COST && (int)a < localBestC) {
-        localBestC = (int)a;
-        localBestD = dIdx;
+      if (c != INVALID_COST) {
+        const int packed = (((int)a) << 8) | dIdx;
+        localBestPacked = min(localBestPacked, packed);
       }
     }
   }
 
-  minCostBuf[sub][lane] = localBestC;
-  minDispBuf[sub][lane] = localBestD;
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-    if (lane < stride) {
-      const int cOther = minCostBuf[sub][lane + stride];
-      const int dOther = minDispBuf[sub][lane + stride];
-      const int cCurr = minCostBuf[sub][lane];
-      const int dCurr = minDispBuf[sub][lane];
-      if (cOther < cCurr || (cOther == cCurr && dOther >= 0 && (dCurr < 0 || dOther < dCurr))) {
-        minCostBuf[sub][lane] = cOther;
-        minDispBuf[sub][lane] = dOther;
-      }
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-
-  const int bestC = *minCostBuf[sub];
-  const int bestD = *minDispBuf[sub];
-
-  if (bestD < 0) {
+  // 1 hardware Wave32 instruction replaces 5 barriers + 2 LDS arrays!
+  const int globalBestPacked = sub_group_reduce_min(localBestPacked);
+  if (globalBestPacked == INT_MAX) {
     if (lane == 0) dispLOut[(size_t)y * (size_t)width + (size_t)x] = invalidDisparity;
     return;
   }
+
+  const int bestC = globalBestPacked >> 8;
+  const int bestD = globalBestPacked & 0xFF;
+
+  // Ensure sharedAgg/sharedCost writes from all lanes in this subgroup are visible to lane 0
+  sub_group_barrier(CLK_LOCAL_MEM_FENCE);
 
   if (uniquenessRatio > 0) {
     int localMinOther = INT_MAX;
@@ -78,17 +65,8 @@ __kernel void k_wta_subpixel_and_right_scatter(
       }
     }
 
-    minCostBuf[sub][lane] = localMinOther;
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-      if (lane < stride) {
-        minCostBuf[sub][lane] = min(minCostBuf[sub][lane], minCostBuf[sub][lane + stride]);
-      }
-      barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    const int minOther = *minCostBuf[sub];
+    // 1 hardware Wave32 instruction replaces another 5 barriers!
+    const int minOther = sub_group_reduce_min(localMinOther);
     if (minOther != INT_MAX) {
       if ((long)bestC * (long)(100 + uniquenessRatio) > (long)minOther * 100L) {
         if (lane == 0) dispLOut[(size_t)y * (size_t)width + (size_t)x] = invalidDisparity;

@@ -19,7 +19,7 @@
 
 static std::string KernelLanguageOption() {
 #if OPENCL_TARGET_VERSION >= 300
-  return "-cl-std=CL3.0";
+  return "-cl-std=CL2.0"; //AMD ROCm's OpenCL compiler (comgr / LLVM) does not support -cl-std=CL3.0 (CL_BUILD_PROGRAM_FAILURE = -11) — it supports up to -cl-std=CL2.0 (and -cl-std=CL1.2).
 #elif OPENCL_TARGET_VERSION >= 200
   return "-cl-std=CL2.0";
 #elif OPENCL_TARGET_VERSION >= 120
@@ -106,13 +106,17 @@ std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& pref
 }
 
 std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
-  std::array<char, 128> cVer{};
-  clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, cVer.size(), cVer.data(), nullptr);
-  const std::string verStr(cVer.data());
-  if (verStr.find("OpenCL C 3.") != std::string::npos) return "-cl-std=CL3.0";
-  if (verStr.find("OpenCL C 2.") != std::string::npos) return "-cl-std=CL2.0";
+  std::array<char, 256> ver{};
+  clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, ver.size(), ver.data(), nullptr);
+  const std::string v(ver.data());
+
+  // Clamp at CL2.0: AMD ROCm comgr rejects -cl-std=CL3.0, and CL2.0/CL1.2 is universally supported
+  if (v.find("OpenCL C 2.") != std::string::npos || v.find("OpenCL C 3.") != std::string::npos) {
+    return "-cl-std=CL2.0";
+  }
   return "-cl-std=CL1.2";
 }
+
 
 std::string SgbmOpenClRunner::buildCompilerOptions(const DeviceSpecs& specs, const TuningConfig& cfg, int numDisparities) {
   const int apron = 2;
@@ -126,7 +130,7 @@ std::string SgbmOpenClRunner::buildCompilerOptions(const DeviceSpecs& specs, con
   auto cl_ver = detectOpenClCStandard(device_);  // Ensure OpenCL C standard is detected before building options
 
   std::ostringstream opts;
-  opts << cl_ver << " -cl-mad-enable -cl-fast-relaxed-math "
+  opts << " -cl-mad-enable -cl-fast-relaxed-math "
        << "-D WARP_WIDTH=" << specs.warpWidth << " "
        << "-D PF_WG_W=" << specs.pfWgW << " "
        << "-D PF_WG_H=" << specs.pfWgH << " "
@@ -191,9 +195,7 @@ void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths)
   CL_CHECK(err);
 
   // Stage 2 kernels: BT pixel cost + box filter cost
-  kernelBtPixel_ = clCreateKernel(program_, "k_bt_pixel_cost", &err);
-  CL_CHECK(err);
-  kernelBoxFilter_ = clCreateKernel(program_, "k_box_filter_cost", &err);
+  kernelBtBoxFused_ = clCreateKernel(program_, "k_bt_box_fused", &err);
   CL_CHECK(err);
 
   // Stage 3 kernels: 4-pass bidirectional SGM aggregation
@@ -219,7 +221,6 @@ void SgbmOpenClRunner::refineWarpWidthFromKernel() {
     tuningConfig_.overrideWarpWidth = hwWarpWidth;
     specs_ = queryAndTuneDevice(device_, tuningConfig_);
     // Release old program/kernels and rebuild with exact hardware warp width
-    clReleaseKernel(kernelBoxFilter_);
     clReleaseKernel(kernelBtPixel_);
     clReleaseKernel(kernelPrefilter_);
     clReleaseKernel(kernelAggDir_);
@@ -314,24 +315,25 @@ double SgbmOpenClRunner::runPrefilter(const std::vector<uint8_t>& rawLeft, int p
   return kernelMs;
 }
 
-double SgbmOpenClRunner::runBoxCost(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, int preFilterCap, int minDisparity, int blockSize, std::vector<short>& costOut) {
-  cl_int err = CL_SUCCESS;
+double SgbmOpenClRunner::runBoxCost(
+    const std::vector<uint8_t>& rawLeft,
+    const std::vector<uint8_t>& rawRight,
+    int preFilterCap,
+    int minDisparity,
+    int blockSize,
+    std::vector<short>& costOut) {
+  // 1. Non-blocking upload of Left and Right raw images (hardware-agnostic)
+  CL_CHECK(clEnqueueWriteBuffer(
+      queue_, bufRawL_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawLeft.data(), 0, nullptr, nullptr));
+  CL_CHECK(clEnqueueWriteBuffer(
+      queue_, bufRawR_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawRight.data(), 0, nullptr, nullptr));
 
-  // 1. Zero-copy upload of Left and Right raw images
-  void* pInL = clEnqueueMapBuffer(queue_, bufRawL_, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, 0, numPixels_ * sizeof(uint8_t), 0, nullptr, nullptr, &err);
-  CL_CHECK(err);
-  std::memcpy(pInL, rawLeft.data(), numPixels_ * sizeof(uint8_t));
-  CL_CHECK(clEnqueueUnmapMemObject(queue_, bufRawL_, pInL, 0, nullptr, nullptr));
+  // 2. Stage 1: Prefilter + Birchfield-Tomasi Bounds (BOTH Left & Right)
+  const std::array<size_t, 2> pfLocal = {specs_.pfWgW, specs_.pfWgH};
+  const std::array<size_t, 2> pfGlobal = {
+      ((static_cast<size_t>(width_) + specs_.pfWgW - 1) / specs_.pfWgW) * specs_.pfWgW,
+      ((static_cast<size_t>(height_) + specs_.pfWgH - 1) / specs_.pfWgH) * specs_.pfWgH};
 
-  void* pInR = clEnqueueMapBuffer(queue_, bufRawR_, CL_TRUE, CL_MAP_WRITE_INVALIDATE_REGION, 0, numPixels_ * sizeof(uint8_t), 0, nullptr, nullptr, &err);
-  CL_CHECK(err);
-  std::memcpy(pInR, rawRight.data(), numPixels_ * sizeof(uint8_t));
-  CL_CHECK(clEnqueueUnmapMemObject(queue_, bufRawR_, pInR, 0, nullptr, nullptr));
-
-  // Stage 2A & 2B dispatch:
-  const std::array<size_t, 3> pfLocal = {specs_.costWgW, specs_.costWgH, 1};
-  const std::array<size_t, 3> pfGlobal = {((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
-  // Left prefilter + BT bounds
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 0, sizeof(cl_mem), &bufRawL_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 1, sizeof(cl_mem), &bufSobelL_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 2, sizeof(cl_mem), &bufSobelBoundsL_));
@@ -339,57 +341,58 @@ double SgbmOpenClRunner::runBoxCost(const std::vector<uint8_t>& rawLeft, const s
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 4, sizeof(int), &width_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 5, sizeof(int), &height_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 6, sizeof(int), &preFilterCap));
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, nullptr));
+  CL_CHECK(clEnqueueNDRangeKernel(
+      queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, nullptr));
 
-  // 3A. Dispatch Kernel 2A: k_bt_pixel_cost (32x8 = 256 threads/WG)
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 0, sizeof(cl_mem), &bufRawL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 1, sizeof(cl_mem), &bufRawR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 2, sizeof(cl_mem), &bufSobelL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 3, sizeof(cl_mem), &bufSobelR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 4, sizeof(cl_mem), &bufSobelBoundsL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 5, sizeof(cl_mem), &bufSobelBoundsR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 6, sizeof(cl_mem), &bufRawBoundsL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 7, sizeof(cl_mem), &bufRawBoundsR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 8, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 9, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 10, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 11, sizeof(int), &minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 12, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 0, sizeof(cl_mem), &bufRawR_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 1, sizeof(cl_mem), &bufSobelR_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 2, sizeof(cl_mem), &bufSobelBoundsR_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 3, sizeof(cl_mem), &bufRawBoundsR_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 4, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 5, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelPrefilter_, 6, sizeof(int), &preFilterCap));
+  CL_CHECK(clEnqueueNDRangeKernel(
+      queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, nullptr));
 
-  const std::array<size_t, 3> stage2Local_bt = {specs_.costWgW, specs_.costWgH, 1};
-  const std::array<size_t, 3> stage2Global_bt = {static_cast<size_t>((width_ + specs_.costWgW - 1) / specs_.costWgW) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
+  // 3. Stage 2: Fused Dual-BT Pixel Cost + BxB Box Filter (k_bt_box_fused)
+  const std::array<size_t, 3> stage2Local = {specs_.costWgW, specs_.costWgH, 1};
+  const std::array<size_t, 3> stage2Global = {
+      ((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.costWgW,
+      static_cast<size_t>(height_) * specs_.costWgH,
+      1};
 
-  cl_event btEvent = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBtPixel_, 3, nullptr, stage2Global_bt.data(), stage2Local_bt.data(), 0, nullptr, &btEvent));
+  cl_event evCost = nullptr;
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 0, sizeof(cl_mem), &bufRawL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 1, sizeof(cl_mem), &bufRawR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 2, sizeof(cl_mem), &bufSobelL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 3, sizeof(cl_mem), &bufSobelR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 4, sizeof(cl_mem), &bufSobelBoundsL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 5, sizeof(cl_mem), &bufSobelBoundsR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 6, sizeof(cl_mem), &bufRawBoundsL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 7, sizeof(cl_mem), &bufRawBoundsR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 8, sizeof(cl_mem), &bufCostL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 9, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 10, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 11, sizeof(int), &minDisparity));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 12, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 13, sizeof(int), &blockSize));
+  CL_CHECK(clEnqueueNDRangeKernel(
+      queue_, kernelBtBoxFused_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evCost));
 
-  // 3B. Dispatch Kernel 2B: k_box_filter_cost (32x8 = 256 threads/WG)
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 0, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 4, sizeof(int), &minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 5, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 6, sizeof(int), &blockSize));
+  // 4. Blocking readback into costOut (also drains queue_ cleanly)
+  const size_t totalElems = numPixels_ * static_cast<size_t>(numDisparities_);
+  costOut.resize(totalElems);
+  CL_CHECK(clEnqueueReadBuffer(
+      queue_, bufCostL_, CL_TRUE, 0, totalElems * sizeof(short), costOut.data(), 0, nullptr, nullptr));
 
-  const std::array<size_t, 3> stage2Local_box = {specs_.costWgW, specs_.costWgH, 1};
-  const std::array<size_t, 3> stage2Global_box = {static_cast<size_t>((width_ + specs_.costWgW - 1) / specs_.costWgW) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
+  cl_ulong t0 = 0, t1 = 0;
+  CL_CHECK(clGetEventProfilingInfo(evCost, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr));
+  CL_CHECK(clGetEventProfilingInfo(evCost, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, nullptr));
+  clReleaseEvent(evCost);
 
-  cl_event boxEvent = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxFilter_, 3, nullptr, stage2Global_box.data(), stage2Local_box.data(), 0, nullptr, &boxEvent));
-  CL_CHECK(clFinish(queue_));
-
-  cl_ulong t0 = 0, t1 = 0, t2 = 0, t3 = 0;
-  CL_CHECK(clGetEventProfilingInfo(btEvent, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, nullptr));
-  CL_CHECK(clGetEventProfilingInfo(btEvent, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, nullptr));
-  CL_CHECK(clGetEventProfilingInfo(boxEvent, CL_PROFILING_COMMAND_START, sizeof(t2), &t2, nullptr));
-  CL_CHECK(clGetEventProfilingInfo(boxEvent, CL_PROFILING_COMMAND_END, sizeof(t3), &t3, nullptr));
-  clReleaseEvent(btEvent);
-  clReleaseEvent(boxEvent);
-
-  const double btMs = static_cast<double>(t1 - t0) * 1e-6;
-  const double boxMs = static_cast<double>(t3 - t2) * 1e-6;
-  return btMs + boxMs;
+  return static_cast<double>(t1 - t0) * 1e-6;
 }
+
 
 double SgbmOpenClRunner::runAggregate(int P1, int P2, std::vector<uint16_t>& aggOut) {
   struct Dir {
@@ -536,30 +539,24 @@ void SgbmOpenClRunner::compute(const std::vector<uint8_t>& rawLeft, const std::v
   const std::array<size_t, 3> stage2Local = {specs_.costWgW, specs_.costWgH, 1};
   const std::array<size_t, 3> stage2Global = {((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
 
-  cl_event evBt = nullptr, evBox = nullptr;
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 0, sizeof(cl_mem), &bufRawL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 1, sizeof(cl_mem), &bufRawR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 2, sizeof(cl_mem), &bufSobelL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 3, sizeof(cl_mem), &bufSobelR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 4, sizeof(cl_mem), &bufSobelBoundsL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 5, sizeof(cl_mem), &bufSobelBoundsR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 6, sizeof(cl_mem), &bufRawBoundsL_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 7, sizeof(cl_mem), &bufRawBoundsR_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 8, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 9, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 10, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 11, sizeof(int), &p.minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBtPixel_, 12, sizeof(int), &numDisparities_));
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBtPixel_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBt));
+  cl_event evCost = nullptr;
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 0, sizeof(cl_mem), &bufRawL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 1, sizeof(cl_mem), &bufRawR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 2, sizeof(cl_mem), &bufSobelL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 3, sizeof(cl_mem), &bufSobelR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 4, sizeof(cl_mem), &bufSobelBoundsL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 5, sizeof(cl_mem), &bufSobelBoundsR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 6, sizeof(cl_mem), &bufRawBoundsL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 7, sizeof(cl_mem), &bufRawBoundsR_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 8, sizeof(cl_mem), &bufCostL_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 9, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 10, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 11, sizeof(int), &p.minDisparity));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 12, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBtBoxFused_, 13, sizeof(int), &p.blockSize));
+  CL_CHECK(clEnqueueNDRangeKernel(
+      queue_, kernelBtBoxFused_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evCost));
 
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 0, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 4, sizeof(int), &p.minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 5, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 6, sizeof(int), &p.blockSize));
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxFilter_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBox));
 
   // 4. Stage 3: 4-Pass Bidirectional 256-Thread SGM Aggregation
   struct Axis {
@@ -636,7 +633,8 @@ void SgbmOpenClRunner::compute(const std::vector<uint8_t>& rawLeft, const std::v
 
   // Record accurate per-stage GPU profiling timestamps
   timings.prefilterMs = eventMs(evPfL) + eventMs(evPfR);
-  timings.costVolumeMs = eventMs(evBt) + eventMs(evBox);
+  timings.costVolumeMs = eventMs(evCost);
+
   timings.aggregationMs = 0.0;
   for (auto& ev : evAxes) timings.aggregationMs += eventMs(ev);
   timings.wtaLrMs = eventMs(evClear) + eventMs(evWta) + eventMs(evLr);

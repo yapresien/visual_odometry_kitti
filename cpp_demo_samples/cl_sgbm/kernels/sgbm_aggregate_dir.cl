@@ -1,3 +1,7 @@
+
+#pragma OPENCL EXTENSION cl_khr_subgroups : enable
+
+
 // ─── Kernel 3 (16-bit Saturated aggOut): Scanline-Parallel SGM Aggregation ───
 __attribute__((reqd_work_group_size(SGM_WG_SIZE, 1, 1)))
 __kernel void k_sgm_aggregate_dir(
@@ -138,9 +142,8 @@ __kernel void k_sgm_aggregate_dir(
   }
 }
 
-// ─── Kernel 3 (4-Pass Bidirectional, 256-Thread WG): SGM Axis Aggregation ────
-// Packs SGM_ROWS_PER_WG (8) scanlines per 256-thread WG (100% CU occupancy on gfx1102)
-// and sweeps BOTH forward (+dx, +dy) and backward (-dx, -dy) in a single pass!
+// ─── Kernel 3 (Subgroup-Accelerated Bidirectional SGM): 4-Pass Axis Sweep ────
+// Replaces 10 LDS barriers per pixel step with Wave32 sub_group_reduce_min & sub_group_any!
 __attribute__((reqd_work_group_size(SGM_WG_SIZE, WTA_ROWS_PER_WG, 1)))
 __kernel void k_sgm_bidi_axis(
     __global const short* restrict costIn,
@@ -171,7 +174,6 @@ __kernel void k_sgm_bidi_axis(
     y0 = (scanId < height) ? (height - 1 - scanId) : 0;
     steps = min(width - x0, height - y0);
   } else {
-    // dx < 0 && dy > 0 (TR -> BL and reverse BL -> TR)
     if (scanId >= width + height - 1) return;
     x0 = (scanId < width) ? scanId : (width - 1);
     y0 = (scanId < width) ? 0 : (scanId - width + 1);
@@ -179,7 +181,6 @@ __kernel void k_sgm_bidi_axis(
   }
 
   __local int sharedLPrev[WTA_ROWS_PER_WG][NUM_DISPARITIES + 2];
-  __local int sharedMin[WTA_ROWS_PER_WG][SGM_WG_SIZE];
 
   if (lane == 0) {
     *sharedLPrev[sub] = MAX_PATH_INT;
@@ -196,34 +197,25 @@ __kernel void k_sgm_bidi_axis(
     const size_t baseIdx = ((size_t)y * (size_t)width + (size_t)x) * (size_t)numDisparities;
     int cVal[D_PER_LANE];
     int laneMinPrev = MAX_PATH_INT;
-    bool hasAnyValid = false;
+    int hasAnyValid = 0;
 
     for (int k = 0; k < D_PER_LANE; ++k) {
       const int d = k * SGM_WG_SIZE + lane;
       if (d < numDisparities) {
         const short c = costIn[baseIdx + (size_t)d];
         cVal[k] = (int)c;
-        if (c != INVALID_COST) hasAnyValid = true;
+        if (c != INVALID_COST) hasAnyValid = 1;
         sharedLPrev[sub][d + 1] = lPrev[k];
         laneMinPrev = min(laneMinPrev, lPrev[k]);
       }
     }
 
-    sharedMin[sub][lane] = laneMinPrev;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-      if (lane < stride) sharedMin[sub][lane] = min(sharedMin[sub][lane], sharedMin[sub][lane + stride]);
-      barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const int minPrev = *sharedMin[sub];
+    // Hardware Wave32 reductions (zero LDS buffers, zero reduction barriers!)
+    const int minPrev = sub_group_reduce_min(laneMinPrev);
+    const bool currHasValid = (sub_group_any(hasAnyValid) != 0);
 
-    sharedMin[sub][lane] = hasAnyValid ? 1 : 0;
+    // Single barrier so neighbor lanes see updated sharedLPrev[sub][d +/- 1]
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-      if (lane < stride) sharedMin[sub][lane] |= sharedMin[sub][lane + stride];
-      barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const bool currHasValid = (*sharedMin[sub] != 0);
 
     for (int k = 0; k < D_PER_LANE; ++k) {
       const int d = k * SGM_WG_SIZE + lane;
@@ -264,34 +256,22 @@ __kernel void k_sgm_bidi_axis(
     const size_t baseIdx = ((size_t)y * (size_t)width + (size_t)x) * (size_t)numDisparities;
     int cVal[D_PER_LANE];
     int laneMinPrev = MAX_PATH_INT;
-    bool hasAnyValid = false;
+    int hasAnyValid = 0;
 
     for (int k = 0; k < D_PER_LANE; ++k) {
       const int d = k * SGM_WG_SIZE + lane;
       if (d < numDisparities) {
         const short c = costIn[baseIdx + (size_t)d];
         cVal[k] = (int)c;
-        if (c != INVALID_COST) hasAnyValid = true;
+        if (c != INVALID_COST) hasAnyValid = 1;
         sharedLPrev[sub][d + 1] = lPrev[k];
         laneMinPrev = min(laneMinPrev, lPrev[k]);
       }
     }
 
-    sharedMin[sub][lane] = laneMinPrev;
+    const int minPrev = sub_group_reduce_min(laneMinPrev);
+    const bool currHasValid = (sub_group_any(hasAnyValid) != 0);
     barrier(CLK_LOCAL_MEM_FENCE);
-    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-      if (lane < stride) sharedMin[sub][lane] = min(sharedMin[sub][lane], sharedMin[sub][lane + stride]);
-      barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const int minPrev = *sharedMin[sub];
-
-    sharedMin[sub][lane] = hasAnyValid ? 1 : 0;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-      if (lane < stride) sharedMin[sub][lane] |= sharedMin[sub][lane + stride];
-      barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const bool currHasValid = (*sharedMin[sub] != 0);
 
     for (int k = 0; k < D_PER_LANE; ++k) {
       const int d = k * SGM_WG_SIZE + lane;
@@ -317,168 +297,3 @@ __kernel void k_sgm_bidi_axis(
     barrier(CLK_LOCAL_MEM_FENCE);
   }
 }
-
-
-// ─── Helper A: Tiled Transpose [y][x][d] -> [y][d][x] (~0.5 ms) ───────────────
-__attribute__((reqd_work_group_size(32, 8, 1)))
-__kernel void k_transpose_xd_to_dx(
-    __global const short* restrict srcXD,
-    __global short* restrict dstDX,
-    const int width,
-    const int height,
-    const int numDisparities) {
-  const int lx = get_local_id(0);  // 0..31
-  const int ly = get_local_id(1);  // 0..7
-  const int xTile = get_group_id(0) * 32;
-  const int dTile = get_group_id(1) * 32;
-  const int y = get_group_id(2);
-
-  if (y >= height) return;
-
-  __local short tile[32][33];  // +1 padding eliminates LDS bank conflicts
-
-  const size_t yOff = (size_t)y * (size_t)width * (size_t)numDisparities;
-
-  // Load 32x32 block from [y][x][d] (lx = d, ly+row = x) -> 100% coalesced!
-  for (int row = ly; row < 32; row += 8) {
-    const int gx = xTile + row;
-    const int gd = dTile + lx;
-    if (gx < width && gd < numDisparities) {
-      tile[row][lx] = srcXD[yOff + (size_t)gx * (size_t)numDisparities + (size_t)gd];
-    }
-  }
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Store 32x32 block to [y][d][x] (lx = x, ly+row = d) -> 100% coalesced!
-  for (int row = ly; row < 32; row += 8) {
-    const int gd = dTile + row;
-    const int gx = xTile + lx;
-    if (gd < numDisparities && gx < width) {
-      dstDX[yOff + (size_t)gd * (size_t)width + (size_t)gx] = tile[lx][row];
-    }
-  }
-}
-
-// ─── Helper B: Tiled Transpose-Add [y][d][x] -> aggOut[y][x][d] (~0.6 ms) ────
-__attribute__((reqd_work_group_size(32, 8, 1)))
-__kernel void k_add_dx_to_xd(
-    __global const ushort* restrict srcDX,
-    __global ushort* restrict aggOutXD,
-    const int width,
-    const int height,
-    const int numDisparities) {
-  const int lx = get_local_id(0);
-  const int ly = get_local_id(1);
-  const int xTile = get_group_id(0) * 32;
-  const int dTile = get_group_id(1) * 32;
-  const int y = get_group_id(2);
-
-  if (y >= height) return;
-
-  __local ushort tile[32][33];
-  const size_t yOff = (size_t)y * (size_t)width * (size_t)numDisparities;
-
-  // Coalesced load from [y][d][x] (lx = x, ly+row = d)
-  for (int row = ly; row < 32; row += 8) {
-    const int gd = dTile + row;
-    const int gx = xTile + lx;
-    if (gd < numDisparities && gx < width) {
-      tile[row][lx] = srcDX[yOff + (size_t)gd * (size_t)width + (size_t)gx];
-    }
-  }
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  // Coalesced read-modify-write into aggOut[y][x][d] (lx = d, ly+row = x)
-  for (int row = ly; row < 32; row += 8) {
-    const int gx = xTile + row;
-    const int gd = dTile + lx;
-    if (gx < width && gd < numDisparities) {
-      const size_t idx = yOff + (size_t)gx * (size_t)numDisparities + (size_t)gd;
-      aggOutXD[idx] = convert_ushort_sat((int)aggOutXD[idx] + (int)tile[lx][row]);
-    }
-  }
-}
-
-// ─── Kernel 3B (Zero-VGPR-Spill LDS State): Column-Coalesced Vertical/Diag SGM ─
-__attribute__((reqd_work_group_size(32, 1, 1)))
-__kernel void k_sgm_col_vert_diag(
-    __global const short* restrict costDX,
-    __global ushort* restrict aggDX,
-    const int width,
-    const int height,
-    const int numDisparities,
-    const int P1,
-    const int P2,
-    const int dx,
-    const int isFirstDX) {
-  const int lane = get_local_id(0);  // 0..31 -> column offset
-  const int tileIdx = get_group_id(0);
-
-  const int xStartBase = (dx == 0) ? (tileIdx * 32) : (-height + tileIdx * 32);
-  const int x0 = xStartBase + lane;
-
-  // Store lPrev in LDS (16.5 KB) instead of 128 VGPRs -> ZERO register spills to DRAM!
-  __local int lPrevLDS[32][NUM_DISPARITIES + 1];
-
-  for (int d = 0; d < numDisparities; ++d) {
-    lPrevLDS[lane][d] = MAX_PATH_INT;
-  }
-  bool prevValid = false;
-
-  const size_t planeStride = (size_t)numDisparities * (size_t)width;
-
-  for (int y = 0; y < height; ++y) {
-    const int x = x0 + y * dx;
-    if (x < 0 || x >= width) {
-      for (int d = 0; d < numDisparities; ++d) lPrevLDS[lane][d] = MAX_PATH_INT;
-      prevValid = false;
-      continue;
-    }
-
-    const size_t yBase = (size_t)y * planeStride + (size_t)x;
-
-    int minPrev = MAX_PATH_INT;
-    if (prevValid) {
-      for (int d = 0; d < numDisparities; ++d) {
-        minPrev = min(minPrev, lPrevLDS[lane][d]);
-      }
-    }
-
-    int prevDVal = MAX_PATH_INT;
-    bool currHasValid = false;
-
-    for (int d = 0; d < numDisparities; ++d) {
-      const size_t idx = yBase + (size_t)d * (size_t)width;
-      const short cShort = costDX[idx];
-      const int curDVal = lPrevLDS[lane][d];
-      const int nextDVal = (d + 1 < numDisparities) ? lPrevLDS[lane][d + 1] : MAX_PATH_INT;
-
-      int lCurr = MAX_PATH_INT;
-      if (cShort != INVALID_COST) {
-        currHasValid = true;
-        const int c = (int)cShort;
-        if (!prevValid || minPrev >= MAX_PATH_INT) {
-          lCurr = c;
-        } else {
-          const int best = min(
-              min(curDVal, prevDVal + P1),
-              min(nextDVal + P1, minPrev + P2));
-          lCurr = c + best - minPrev;
-        }
-      }
-
-      prevDVal = curDVal;
-      lPrevLDS[lane][d] = lCurr;
-
-      const int addVal = (cShort != INVALID_COST) ? lCurr : 0;
-      if (isFirstDX) {
-        aggDX[idx] = convert_ushort_sat(addVal);
-      } else {
-        aggDX[idx] = convert_ushort_sat((int)aggDX[idx] + addVal);
-      }
-    }
-
-    prevValid = currHasValid;
-  }
-}
-
