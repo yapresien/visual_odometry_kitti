@@ -15,6 +15,10 @@
 #include <thread>
 #include <vector>
 
+
+#include "sgbm_opencl.h"
+
+
 namespace fs = std::filesystem;
 using Clock = std::chrono::high_resolution_clock;
 
@@ -195,17 +199,54 @@ int main(int argc, char** argv) {
     cv::namedWindow("Stereo Trajectory Map", cv::WINDOW_AUTOSIZE);
 
     // ── Stereo matcher (CPU — OpenCL SGBM does not exist) ───────────────────
-    auto sgbm = cv::StereoSGBM::create(
-        0, NUM_DISP, BLOCK_SIZE,
-        P1_SGBM, P2_SGBM,
-        1, 63, UNIQUENESS, 100, 32,
-        cv::StereoSGBM::MODE_SGBM_3WAY);
+    // auto sgbm = cv::StereoSGBM::create(
+    //     0, NUM_DISP, BLOCK_SIZE,
+    //     P1_SGBM, P2_SGBM,
+    //     1, 63, UNIQUENESS, 100, 32,
+    //     cv::StereoSGBM::MODE_SGBM_3WAY);
 
     // ── Bootstrap ───────────────────────────────────────────────────────────
     cv::Mat prev_l_mat = cv::imread(img0_files[0], cv::IMREAD_GRAYSCALE);
     cv::Mat prev_r_mat = cv::imread(img1_files[0], cv::IMREAD_GRAYSCALE);
     if (prev_l_mat.empty()) { std::cerr << "[ERR] cannot read frame 0\n"; return 1; }
     int h = prev_l_mat.rows, w = prev_l_mat.cols;
+
+    // ── Stereo matcher (OpenCL SGBM when --no-ocl is not set, CPU fallback) ─
+    std::unique_ptr<SgbmOpenClRunner> cl_sgbm;
+    ClSgbmParams cl_params;
+    cl_params.minDisparity = 0;
+    cl_params.blockSize = BLOCK_SIZE;
+    cl_params.P1 = P1_SGBM;
+    cl_params.P2 = P2_SGBM;
+    cl_params.preFilterCap = 63;
+    cl_params.uniquenessRatio = UNIQUENESS;
+    cl_params.speckleWindowSize = 100;
+    cl_params.speckleRange = 2;
+    cl_params.disp12MaxDiff = 1;
+    cl_params.invalidDisparity = -1.0f;
+    const int dsFactor = 2;  // 1 = full-res (1.20% drift), 2 = half-res (~6-8 ms stereo)
+    cl_params.downsampleFactor = dsFactor;
+    cl_params.sgmPaths = 5;  // At 1/2 res, 5-path runs in ~5 ms with full diagonal support!
+    
+    cv::Ptr<cv::StereoSGBM> cpu_sgbm;
+    if (useOcl && cv::ocl::haveOpenCL()) {
+        cl_sgbm = std::make_unique<SgbmOpenClRunner>(
+            std::vector<std::string>{"/home/master/myspace/projects/visual_odometry_kitti/cpp_demo_samples/cl_sgbm/kernels/sgbm.cl"},  // Update path if needed
+           w / dsFactor, h / dsFactor, NUM_DISP / dsFactor);
+    } else {
+        cpu_sgbm = cv::StereoSGBM::create(
+            0, NUM_DISP, BLOCK_SIZE,
+            P1_SGBM, P2_SGBM,
+            1, 63, UNIQUENESS, 100, 32,
+            cv::StereoSGBM::MODE_SGBM_3WAY);
+    }
+
+
+    // ── Bootstrap ───────────────────────────────────────────────────────────
+    // cv::Mat prev_l_mat = cv::imread(img0_files[0], cv::IMREAD_GRAYSCALE);
+    // cv::Mat prev_r_mat = cv::imread(img1_files[0], cv::IMREAD_GRAYSCALE);
+    // if (prev_l_mat.empty()) { std::cerr << "[ERR] cannot read frame 0\n"; return 1; }
+    // int h = prev_l_mat.rows, w = prev_l_mat.cols;
 
     // These two are used by the accelerated stages and stay on device
     cv::UMat prev_l_umat = prev_l_mat.getUMat(cv::ACCESS_READ);
@@ -237,6 +278,10 @@ int main(int argc, char** argv) {
 
     const int nFrames = (int)img0_files.size();
     const int lastFrame = (MAX_FRAMES > 0) ? std::min(MAX_FRAMES, nFrames - 1) : nFrames - 1;
+
+    const size_t nPix = static_cast<size_t>(w) * static_cast<size_t>(h);
+    std::vector<uint8_t> rawL(nPix), rawR(nPix);
+    std::vector<float> cl_disp_buf(nPix);
 
     // ═══════════════════════════════════════════════════════════════════════
     // MAIN LOOP
@@ -273,12 +318,27 @@ int main(int argc, char** argv) {
         stage_times["detect"].push_back(msSince(t));
 
         // ── stereo (CPU; output is Mat for PnP pixel access) ───────────────
+        // ── stereo (OpenCL SGBM -> CV_32F directly for PnP, or CPU fallback) ──
         t = Clock::now();
-        cv::Mat disp16;
-        sgbm->compute(prev_l_mat, prev_r_mat, disp16);
         cv::Mat disp_float;
-        disp16.convertTo(disp_float, CV_32F, 1.0 / 16.0);
+        std::vector<float> cl_disp_buf;
+        if (cl_sgbm) {
+            if (!prev_l_mat.isContinuous()) prev_l_mat = prev_l_mat.clone();
+            if (!prev_r_mat.isContinuous()) prev_r_mat = prev_r_mat.clone();
+            std::memcpy(rawL.data(), prev_l_mat.data, nPix);
+            std::memcpy(rawR.data(), prev_r_mat.data, nPix);
+
+            ClSgbmTimings cl_t;
+            cl_sgbm->compute(rawL, rawR, cl_params, cl_disp_buf, cl_t);
+            disp_float = cv::Mat(h, w, CV_32F, cl_disp_buf.data());
+        } else {
+            cv::Mat disp16;
+            cpu_sgbm->compute(prev_l_mat, prev_r_mat, disp16);
+            disp16.convertTo(disp_float, CV_32F, 1.0 / 16.0);
+        }
         stage_times["stereo"].push_back(msSince(t));
+
+
 
         if (SHOW_DISP) {
             double sum = 0; int n = 0;
@@ -463,6 +523,33 @@ int main(int argc, char** argv) {
             ofs << '\n';
         }
         std::cout << "[SAVE] " << traj_log.size() << " rows → est_traj.txt\n";
+        // ── Trajectory ATE & Final Drift vs Ground Truth ────────────────────────
+        if (!gt_xyz.empty() && traj_log.size() > 1) {
+            const size_t nEval = std::min(gt_xyz.size(), traj_log.size());
+            double sumSqErr = 0.0;
+            double totalDist = 0.0;
+            for (size_t i = 0; i < nEval; ++i) {
+                const double ex = traj_log[i].at<double>(0, 3);
+                const double ey = traj_log[i].at<double>(0, 7);
+                const double ez = traj_log[i].at<double>(0, 11);
+                const double dx = ex - gt_xyz[i][0];
+                const double dy = ey - gt_xyz[i][1];
+                const double dz = ez - gt_xyz[i][2];
+                sumSqErr += dx * dx + dy * dy + dz * dz;
+                if (i > 0) {
+                    totalDist += cv::norm(gt_xyz[i] - gt_xyz[i - 1]);
+                }
+            }
+            const double ateRmse = std::sqrt(sumSqErr / static_cast<double>(nEval));
+            const cv::Vec3d estEnd(
+                traj_log[nEval - 1].at<double>(0, 3),
+                traj_log[nEval - 1].at<double>(0, 7),
+                traj_log[nEval - 1].at<double>(0, 11));
+            const double endErr = cv::norm(estEnd - gt_xyz[nEval - 1]);
+            printf("[TRAJ] Frames=%zu | PathLen=%.1f m | ATE_RMSE=%.3f m | EndDrift=%.3f m (%.2f%%)\n",
+                nEval, totalDist, ateRmse, endErr, (totalDist > 0.0) ? (100.0 * endErr / totalDist) : 0.0);
+        }
+    
     }
     cv::destroyAllWindows();
 

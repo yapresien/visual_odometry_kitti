@@ -329,3 +329,93 @@ __kernel void k_bt_box_fused(
     costOut2[baseOut + (size_t)pIdx] = (short2)(out0, out1);
   }
 }
+
+// ─── Optional 2x Downsample / Edge-Aware Upsample Kernels (~0.2 ms) ───────────
+__attribute__((reqd_work_group_size(PF_WG_W, PF_WG_H, 1)))
+__kernel void k_downsample_2x(
+    __global const uchar* restrict srcFull,
+    __global uchar* restrict dstHalf,
+    const int fullW,
+    const int fullH,
+    const int halfW,
+    const int halfH) {
+  const int hx = get_global_id(0);
+  const int hy = get_global_id(1);
+  if (hx >= halfW || hy >= halfH) return;
+
+  const int x0 = hx << 1;
+  const int y0 = hy << 1;
+  const int x1 = min(x0 + 1, fullW - 1);
+  const int y1 = min(y0 + 1, fullH - 1);
+
+  const uint sum =
+      (uint)srcFull[(size_t)y0 * (size_t)fullW + (size_t)x0] +
+      (uint)srcFull[(size_t)y0 * (size_t)fullW + (size_t)x1] +
+      (uint)srcFull[(size_t)y1 * (size_t)fullW + (size_t)x0] +
+      (uint)srcFull[(size_t)y1 * (size_t)fullW + (size_t)x1];
+
+  dstHalf[(size_t)hy * (size_t)halfW + (size_t)hx] = (uchar)((sum + 2u) >> 2);
+}
+
+__attribute__((reqd_work_group_size(PF_WG_W, PF_WG_H, 1)))
+__kernel void k_upsample_disp_2x(
+    __global const float* restrict dispHalf,
+    __global float* restrict dispFull,
+    const int fullW,
+    const int fullH,
+    const int halfW,
+    const int halfH,
+    const float invalidDisparity) {
+  const int fx = get_global_id(0);
+  const int fy = get_global_id(1);
+  if (fx >= fullW || fy >= fullH) return;
+
+  // Map full-res pixel center to half-res coordinate space
+  const float u = ((float)fx + 0.5f) * 0.5f - 0.5f;
+  const float v = ((float)fy + 0.5f) * 0.5f - 0.5f;
+
+  const int x0 = clamp((int)floor(u), 0, halfW - 1);
+  const int y0 = clamp((int)floor(v), 0, halfH - 1);
+  const int x1 = min(x0 + 1, halfW - 1);
+  const int y1 = min(y0 + 1, halfH - 1);
+
+  const float wx = clamp(u - (float)x0, 0.0f, 1.0f);
+  const float wy = clamp(v - (float)y0, 0.0f, 1.0f);
+
+  const float d00 = dispHalf[(size_t)y0 * (size_t)halfW + (size_t)x0];
+  const float d10 = dispHalf[(size_t)y0 * (size_t)halfW + (size_t)x1];
+  const float d01 = dispHalf[(size_t)y1 * (size_t)halfW + (size_t)x0];
+  const float d11 = dispHalf[(size_t)y1 * (size_t)halfW + (size_t)x1];
+
+  const bool v00 = (d00 != invalidDisparity) && isfinite(d00);
+  const bool v10 = (d10 != invalidDisparity) && isfinite(d10);
+  const bool v01 = (d01 != invalidDisparity) && isfinite(d01);
+  const bool v11 = (d11 != invalidDisparity) && isfinite(d11);
+
+  // Guard against depth discontinuity smearing (> 1.5 px in half-res = > 3.0 px full-res)
+  float dRef = invalidDisparity;
+  if (v00) dRef = d00;
+  else if (v10) dRef = d10;
+  else if (v01) dRef = d01;
+  else if (v11) dRef = d11;
+
+  if (dRef == invalidDisparity) {
+    dispFull[(size_t)fy * (size_t)fullW + (size_t)fx] = invalidDisparity;
+    return;
+  }
+
+  float wSum = 0.0f;
+  float valSum = 0.0f;
+  const float w00 = (1.0f - wx) * (1.0f - wy);
+  const float w10 = wx * (1.0f - wy);
+  const float w01 = (1.0f - wx) * wy;
+  const float w11 = wx * wy;
+
+  if (v00 && fabs(d00 - dRef) <= 1.5f) { wSum += w00; valSum += w00 * d00; }
+  if (v10 && fabs(d10 - dRef) <= 1.5f) { wSum += w10; valSum += w10 * d10; }
+  if (v01 && fabs(d01 - dRef) <= 1.5f) { wSum += w01; valSum += w01 * d01; }
+  if (v11 && fabs(d11 - dRef) <= 1.5f) { wSum += w11; valSum += w11 * d11; }
+
+  dispFull[(size_t)fy * (size_t)fullW + (size_t)fx] =
+      (wSum > 0.0f) ? (2.0f * (valSum / wSum)) : invalidDisparity;
+}

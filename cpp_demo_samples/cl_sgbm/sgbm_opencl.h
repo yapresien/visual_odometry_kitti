@@ -59,6 +59,7 @@ struct ClSgbmParams {
   int disp12MaxDiff = 1;
   float invalidDisparity = -1.0f;
   int sgmPaths = 5;  // 4 = 4-path, 5 = MODE_SGBM (default), 8 = MODE_HH
+  int downsampleFactor = 1;
 };
 
 class SgbmOpenClRunner {
@@ -167,4 +168,10 @@ class SgbmOpenClRunner {
   std::vector<uint8_t> speckleVisited_;
   std::vector<std::pair<int, int>> speckleStack_;
   std::vector<std::pair<int, int>> speckleComponent_;
+
+    cl_kernel kernelDownsample2x_ = nullptr;
+  cl_kernel kernelUpsample2x_ = nullptr;
+  cl_mem bufFullRawL_ = nullptr;
+  cl_mem bufFullRawR_ = nullptr;
+  cl_mem bufFullDispL_ = nullptr;
 };
