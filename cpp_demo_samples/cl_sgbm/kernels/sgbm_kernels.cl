@@ -67,10 +67,44 @@ __kernel void k_bt_pixel_cost(
   }
 }
 
-// ─── Kernel 2B (16-bit short): BxB Box Sum over Pixel Cost Volume ────────────
+// ─── Kernel 2B-1: Horizontal Bx1 Box Sum (100% Coalesced Wave32 over D) ───────
 __attribute__((reqd_work_group_size(COST_WG_W, COST_WG_H, 1)))
-__kernel void k_box_filter_cost(
+__kernel void k_box_filter_h(
     __global const ushort* restrict pixelCostIn,
+    __global ushort* restrict horizCostOut,
+    const int width,
+    const int height,
+    const int numDisparities,
+    const int blockSize) {
+  const int lane = get_local_id(0);
+  const int x = get_group_id(0) * COST_WG_H + get_local_id(1);
+  const int y = get_group_id(1);
+
+  if (x >= width || y >= height) return;
+
+  const int B2 = blockSize >> 1;
+  const size_t baseOut = ((size_t)y * (size_t)width + (size_t)x) * (size_t)numDisparities;
+
+  if (x < B2 + 1 || x >= width - B2 - 1) {
+    for (int dIdx = lane; dIdx < numDisparities; dIdx += COST_WG_W) {
+      horizCostOut[baseOut + (size_t)dIdx] = (ushort)INVALID_COST;
+    }
+    return;
+  }
+
+  for (int dIdx = lane; dIdx < numDisparities; dIdx += COST_WG_W) {
+    int sumH = 0;
+    for (int bx = -B2; bx <= B2; ++bx) {
+      sumH += (int)pixelCostIn[baseOut + (size_t)(bx * numDisparities) + (size_t)dIdx];
+    }
+    horizCostOut[baseOut + (size_t)dIdx] = (ushort)min(sumH, INVALID_COST - 1);
+  }
+}
+
+// ─── Kernel 2B-2: Vertical 1xB Box Sum + Border Mask (100% Coalesced over D) ──
+__attribute__((reqd_work_group_size(COST_WG_W, COST_WG_H, 1)))
+__kernel void k_box_filter_v(
+    __global const ushort* restrict horizCostIn,
     __global short* restrict costOut,
     const int width,
     const int height,
@@ -103,11 +137,9 @@ __kernel void k_box_filter_cost(
     }
 
     int blockSum = 0;
+    const size_t rowStride = (size_t)width * (size_t)numDisparities;
     for (int by = -B2; by <= B2; ++by) {
-      const size_t rowBase = ((size_t)(y + by) * (size_t)width + (size_t)x) * (size_t)numDisparities + (size_t)dIdx;
-      for (int bx = -B2; bx <= B2; ++bx) {
-        blockSum += (int)pixelCostIn[rowBase + (size_t)(bx * numDisparities)];
-      }
+      blockSum += (int)horizCostIn[baseOut + (size_t)(by * (int)rowStride) + (size_t)dIdx];
     }
 
     costOut[baseOut + (size_t)dIdx] = (short)min(blockSum, INVALID_COST - 1);

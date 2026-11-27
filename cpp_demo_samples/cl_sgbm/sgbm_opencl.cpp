@@ -9,6 +9,21 @@
     }                                                                                                                        \
   } while (0)
 
+  static std::string KernelLanguageOption()
+{
+#if OPENCL_TARGET_VERSION >= 300
+    return "-cl-std=CL3.0";
+#elif OPENCL_TARGET_VERSION >= 200
+    return "-cl-std=CL2.0";
+#elif OPENCL_TARGET_VERSION >= 120
+    return "-cl-std=CL1.2";
+#elif OPENCL_TARGET_VERSION >= 110
+    return "-cl-std=CL1.1";
+#else
+    return "-cl-std=CL1.0";
+#endif
+}
+
 SgbmOpenClRunner::SgbmOpenClRunner(const std::vector<std::string>& clFilePaths, int width, int height, int numDisparities, const TuningConfig& tuning ) : clFilePaths_(clFilePaths), width_(width), height_(height), numDisparities_(numDisparities), numPixels_(static_cast<size_t>(width) * height), tuningConfig_(tuning) {
   if (width_ <= 0 || height_ <= 0 || numDisparities_ <= 0) {
     throw std::invalid_argument("Invalid image dimensions or numDisparities");
@@ -33,7 +48,8 @@ SgbmOpenClRunner::~SgbmOpenClRunner() {
 
   if (kernelPrefilter_) clReleaseKernel(kernelPrefilter_);
   if (kernelBtPixel_) clReleaseKernel(kernelBtPixel_);
-  if (kernelBoxFilter_) clReleaseKernel(kernelBoxFilter_);
+  if (kernelBoxH_) clReleaseKernel(kernelBoxH_);
+  if (kernelBoxV_) clReleaseKernel(kernelBoxV_);
   if (kernelAggDir_) clReleaseKernel(kernelAggDir_);
   if (kernelWtaSubpixel_) clReleaseKernel(kernelWtaSubpixel_);
   if (kernelRightWta_) clReleaseKernel(kernelRightWta_);
@@ -41,11 +57,123 @@ SgbmOpenClRunner::~SgbmOpenClRunner() {
 
   if (bufDispL_) clReleaseMemObject(bufDispL_);
   if (bufRightMinPacked_) clReleaseMemObject(bufRightMinPacked_);
+  if(bufBoxTemp_) clReleaseMemObject(bufBoxTemp_);
 
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (context_) clReleaseContext(context_);
 }
+
+
+std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
+  std::array<char, 128> cVer{};
+  clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, cVer.size(), cVer.data(), nullptr);
+  const std::string verStr(cVer.data());
+  if (verStr.find("OpenCL C 3.") != std::string::npos) return "-cl-std=CL3.0";
+  if (verStr.find("OpenCL C 2.") != std::string::npos) return "-cl-std=CL2.0";
+  return "-cl-std=CL1.2";
+}
+
+std::string SgbmOpenClRunner::buildCompilerOptions(const DeviceSpecs& specs, const TuningConfig& cfg, int numDisparities) {
+  const int apron = 2;
+  const int pfTileW = static_cast<int>(specs.pfWgW) + 2 * apron;
+  const int pfTileH = static_cast<int>(specs.pfWgH) + 2 * apron;
+  // Make LDS stride odd (coprime to power-of-2 LDS bank counts 16/32/64) to prevent bank conflicts
+  const int pfLdsStride = (pfTileW % 2 == 0) ? (pfTileW + 1) : pfTileW;
+
+  const int maxDPerLane = (numDisparities + static_cast<int>(specs.sgmWgSize) - 1) / static_cast<int>(specs.sgmWgSize);
+
+  auto cl_ver = detectOpenClCStandard(device_);  // Ensure OpenCL C standard is detected before building options
+
+  std::ostringstream opts;
+  opts << cl_ver << " -cl-mad-enable -cl-fast-relaxed-math "
+       << "-D WARP_WIDTH=" << specs.warpWidth << " "
+       << "-D PF_WG_W=" << specs.pfWgW << " "
+       << "-D PF_WG_H=" << specs.pfWgH << " "
+       << "-D PF_TILE_W=" << pfTileW << " "
+       << "-D PF_TILE_H=" << pfTileH << " "
+       << "-D PF_LDS_STRIDE=" << pfLdsStride << " "
+       << "-D COST_WG_W=" << specs.costWgW << " "
+       << "-D COST_WG_H=" << specs.costWgH << " "
+       << "-D SGM_WG_SIZE=" << specs.sgmWgSize << " "
+       << "-D WTA_ROWS_PER_WG=" << specs.costWgH << " "
+       << "-D NUM_DISPARITIES=" << numDisparities << " "
+       << "-D D_PER_LANE=" << maxDPerLane << " "
+       << "-D MAX_B2=" << (cfg.maxBlockSize / 2) << " "
+       << "-D INVALID_COST=32767 ";
+  return opts.str();
+}
+
+void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths) {
+  std::vector<std::string> srcStrings;
+  std::string result;
+  for (const auto& clFilePath : clFilePaths) {
+    std::ifstream file(clFilePath);
+    if (!file.is_open()) throw std::runtime_error("Failed to open kernel file: " + clFilePath);
+    std::stringstream ss;
+    ss << file.rdbuf();
+    srcStrings.push_back(ss.str());
+    result += srcStrings.back();
+  }
+
+  const std::string srcStr = result;
+  const char* srcPtr = srcStr.c_str();
+  const size_t srcLen = srcStr.size();
+
+  cl_int err = CL_SUCCESS;
+  program_ = clCreateProgramWithSource(context_, 1, &srcPtr, &srcLen, &err);
+  CL_CHECK(err);
+
+  std::string buildOpts = KernelLanguageOption();
+
+  auto cflags = buildCompilerOptions(specs_, tuningConfig_, numDisparities_);  // Generate additional build options based on device specs and tuning
+  if (!cflags.empty())
+  {
+      buildOpts += " ";
+      buildOpts += cflags;
+  }
+  std::cout << "Building OpenCL program with options: " << buildOpts << std::endl;
+
+  err = clBuildProgram(program_, 1, &device_, buildOpts.c_str(), nullptr, nullptr);
+  if (err != CL_SUCCESS) {
+    size_t logSize = 0;
+    clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+    std::string buildLog(logSize, '\0');
+    clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, logSize, buildLog.data(), nullptr);
+    std::cerr << "OpenCL Build Log:\n" << buildLog << "\n";
+    CL_CHECK(err);
+  }
+  
+  //Stage 1 kernels: Prefilter + BT bounds
+  kernelClearUint_ = clCreateKernel(program_, "k_clear_uint", &err);
+  CL_CHECK(err);
+
+  kernelPrefilter_ = clCreateKernel(program_, "k_prefilter_and_bt_bounds", &err);
+  CL_CHECK(err);
+
+  //Stage 2 kernels: BT pixel cost + box filter cost
+  kernelBtPixel_ = clCreateKernel(program_, "k_bt_pixel_cost", &err);
+  CL_CHECK(err);
+  kernelBoxH_ = clCreateKernel(program_, "k_box_filter_h", &err);
+  CL_CHECK(err);
+  kernelBoxV_ = clCreateKernel(program_, "k_box_filter_v", &err);
+  CL_CHECK(err);
+
+  //Stage 3 kernels: 4-pass bidirectional SGM aggregation
+  kernelAggDir_ = clCreateKernel(program_, "k_sgm_aggregate_dir", &err);
+  CL_CHECK(err);
+
+  //Stage 4 kernels: WTA + Right scatter + LR check
+  kernelLrCheck_ = clCreateKernel(program_, "k_lr_check_packed", &err);
+  CL_CHECK(err);
+  kernelAggBidiAxis_ = clCreateKernel(program_, "k_sgm_bidi_axis", &err);
+  CL_CHECK(err);
+  kernelWtaScatter_ = clCreateKernel(program_, "k_wta_subpixel_and_right_scatter", &err);
+  CL_CHECK(err);
+
+
+}
+
 
 std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& preferredVendor ) {
   cl_uint numPlatforms = 0;
@@ -95,7 +223,8 @@ void SgbmOpenClRunner::refineWarpWidthFromKernel() {
     tuningConfig_.overrideWarpWidth = hwWarpWidth;
     specs_ = queryAndTuneDevice(device_, tuningConfig_);
     // Release old program/kernels and rebuild with exact hardware warp width
-    clReleaseKernel(kernelBoxFilter_);
+    clReleaseKernel(kernelBoxH_);
+    clReleaseKernel(kernelBoxV_);
     clReleaseKernel(kernelBtPixel_);
     clReleaseKernel(kernelPrefilter_);
     clReleaseKernel(kernelAggDir_);
@@ -239,19 +368,20 @@ double SgbmOpenClRunner::runBoxCost(const std::vector<uint8_t>& rawLeft, const s
   CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBtPixel_, 3, nullptr, stage2Global_bt.data(), stage2Local_bt.data(), 0, nullptr, &btEvent));
 
   // 3B. Dispatch Kernel 2B: k_box_filter_cost (32x8 = 256 threads/WG)
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 0, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 4, sizeof(int), &minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 5, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 6, sizeof(int), &blockSize));
+  assert(kernelBoxH_);
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 0, sizeof(cl_mem), &bufPixelCost_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 1, sizeof(cl_mem), &bufCostL_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 2, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 3, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 4, sizeof(int), &minDisparity));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 5, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 6, sizeof(int), &blockSize));
 
   const std::array<size_t, 3> stage2Local_box = {specs_.costWgW, specs_.costWgH, 1};
   const std::array<size_t, 3> stage2Global_box = {static_cast<size_t>((width_ + specs_.costWgW - 1) / specs_.costWgW) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
 
   cl_event boxEvent = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxFilter_, 3, nullptr, stage2Global_box.data(), stage2Local_box.data(), 0, nullptr, &boxEvent));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxH_, 3, nullptr, stage2Global_box.data(), stage2Local_box.data(), 0, nullptr, &boxEvent));
   CL_CHECK(clFinish(queue_));
 
   cl_ulong t0 = 0, t1 = 0, t2 = 0, t3 = 0;
@@ -451,7 +581,7 @@ void SgbmOpenClRunner::compute(
       static_cast<size_t>(height_) * specs_.costWgH,
       1};
 
-  cl_event evBt = nullptr, evBox = nullptr;
+  cl_event evBt = nullptr, evBoxH = nullptr, evBoxV = nullptr;
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 0, sizeof(cl_mem), &bufRawL_));
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 1, sizeof(cl_mem), &bufRawR_));
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 2, sizeof(cl_mem), &bufSobelL_));
@@ -468,15 +598,26 @@ void SgbmOpenClRunner::compute(
   CL_CHECK(clEnqueueNDRangeKernel(
       queue_, kernelBtPixel_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBt));
 
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 0, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 4, sizeof(int), &p.minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 5, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 6, sizeof(int), &p.blockSize));
+
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 0, sizeof(cl_mem), &bufPixelCost_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 1, sizeof(cl_mem), &bufBoxTemp_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 2, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 3, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 4, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBoxH_, 5, sizeof(int), &p.blockSize));
   CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelBoxFilter_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBox));
+      queue_, kernelBoxH_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBoxH));
+
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 0, sizeof(cl_mem), &bufBoxTemp_));
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 1, sizeof(cl_mem), &bufCostL_));
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 2, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 3, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 4, sizeof(int), &p.minDisparity));
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 5, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBoxV_, 6, sizeof(int), &p.blockSize));
+  CL_CHECK(clEnqueueNDRangeKernel(
+      queue_, kernelBoxV_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBoxV));
+
 
   // 4. Stage 3: 4-Pass Bidirectional 256-Thread SGM Aggregation
   struct Axis {
@@ -567,7 +708,7 @@ void SgbmOpenClRunner::compute(
 
   // Record accurate per-stage GPU profiling timestamps
   timings.prefilterMs = eventMs(evPfL) + eventMs(evPfR);
-  timings.costVolumeMs = eventMs(evBt) + eventMs(evBox);
+  timings.costVolumeMs = eventMs(evBt) + eventMs(evBoxH ) + eventMs(evBoxV);
   timings.aggregationMs = 0.0;
   for (auto& ev : evAxes) timings.aggregationMs += eventMs(ev);
   timings.wtaLrMs = eventMs(evClear) + eventMs(evWta) + eventMs(evLr);
@@ -630,131 +771,6 @@ void SgbmOpenClRunner::initContextAndQueue()
     CL_CHECK(err);
 }
 
-static std::string KernelLanguageOption()
-{
-#if OPENCL_TARGET_VERSION >= 300
-    return "-cl-std=CL3.0";
-#elif OPENCL_TARGET_VERSION >= 200
-    return "-cl-std=CL2.0";
-#elif OPENCL_TARGET_VERSION >= 120
-    return "-cl-std=CL1.2";
-#elif OPENCL_TARGET_VERSION >= 110
-    return "-cl-std=CL1.1";
-#else
-    return "-cl-std=CL1.0";
-#endif
-}
-
-std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
-  std::array<char, 128> cVer{};
-  clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, cVer.size(), cVer.data(), nullptr);
-  const std::string verStr(cVer.data());
-  if (verStr.find("OpenCL C 3.") != std::string::npos) return "-cl-std=CL3.0";
-  if (verStr.find("OpenCL C 2.") != std::string::npos) return "-cl-std=CL2.0";
-  return "-cl-std=CL1.2";
-}
-
-std::string SgbmOpenClRunner::buildCompilerOptions(const DeviceSpecs& specs, const TuningConfig& cfg, int numDisparities) {
-  const int apron = 2;
-  const int pfTileW = static_cast<int>(specs.pfWgW) + 2 * apron;
-  const int pfTileH = static_cast<int>(specs.pfWgH) + 2 * apron;
-  // Make LDS stride odd (coprime to power-of-2 LDS bank counts 16/32/64) to prevent bank conflicts
-  const int pfLdsStride = (pfTileW % 2 == 0) ? (pfTileW + 1) : pfTileW;
-
-  const int maxDPerLane = (numDisparities + static_cast<int>(specs.sgmWgSize) - 1) / static_cast<int>(specs.sgmWgSize);
-
-  auto cl_ver = detectOpenClCStandard(device_);  // Ensure OpenCL C standard is detected before building options
-
-  std::ostringstream opts;
-  opts << cl_ver << " -cl-mad-enable -cl-fast-relaxed-math "
-       << "-D WARP_WIDTH=" << specs.warpWidth << " "
-       << "-D PF_WG_W=" << specs.pfWgW << " "
-       << "-D PF_WG_H=" << specs.pfWgH << " "
-       << "-D PF_TILE_W=" << pfTileW << " "
-       << "-D PF_TILE_H=" << pfTileH << " "
-       << "-D PF_LDS_STRIDE=" << pfLdsStride << " "
-       << "-D COST_WG_W=" << specs.costWgW << " "
-       << "-D COST_WG_H=" << specs.costWgH << " "
-       << "-D SGM_WG_SIZE=" << specs.sgmWgSize << " "
-       << "-D WTA_ROWS_PER_WG=" << specs.costWgH << " "
-       << "-D NUM_DISPARITIES=" << numDisparities << " "
-       << "-D D_PER_LANE=" << maxDPerLane << " "
-       << "-D MAX_B2=" << (cfg.maxBlockSize / 2) << " "
-       << "-D INVALID_COST=32767 ";
-  return opts.str();
-}
-
-void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths) {
-  std::vector<std::string> srcStrings;
-  std::string result;
-  for (const auto& clFilePath : clFilePaths) {
-    std::ifstream file(clFilePath);
-    if (!file.is_open()) throw std::runtime_error("Failed to open kernel file: " + clFilePath);
-    std::stringstream ss;
-    ss << file.rdbuf();
-    srcStrings.push_back(ss.str());
-    result += srcStrings.back();
-  }
-
-  const std::string srcStr = result;
-  const char* srcPtr = srcStr.c_str();
-  const size_t srcLen = srcStr.size();
-
-  cl_int err = CL_SUCCESS;
-  program_ = clCreateProgramWithSource(context_, 1, &srcPtr, &srcLen, &err);
-  CL_CHECK(err);
-
-  std::string buildOpts = KernelLanguageOption();
-
-  buildOpts +=
-      " -cl-mad-enable"
-      " -cl-fast-relaxed-math";
-
-  auto cflags = buildCompilerOptions(specs_, tuningConfig_, numDisparities_);  // Generate additional build options based on device specs and tuning
-  if (!cflags.empty())
-  {
-      buildOpts += " ";
-      buildOpts += cflags;
-  }
-  std::cout << "Building OpenCL program with options: " << buildOpts << std::endl;
-
-  err = clBuildProgram(program_, 1, &device_, buildOpts.c_str(), nullptr, nullptr);
-  if (err != CL_SUCCESS) {
-    size_t logSize = 0;
-    clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
-    std::string buildLog(logSize, '\0');
-    clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, logSize, buildLog.data(), nullptr);
-    std::cerr << "OpenCL Build Log:\n" << buildLog << "\n";
-    CL_CHECK(err);
-  }
-  
-  //Stage 1 kernels: Prefilter + BT bounds
-  kernelClearUint_ = clCreateKernel(program_, "k_clear_uint", &err);
-  CL_CHECK(err);
-
-  kernelPrefilter_ = clCreateKernel(program_, "k_prefilter_and_bt_bounds", &err);
-  CL_CHECK(err);
-
-  //Stage 2 kernels: BT pixel cost + box filter cost
-  kernelBtPixel_ = clCreateKernel(program_, "k_bt_pixel_cost", &err);
-  CL_CHECK(err);
-  kernelBoxFilter_ = clCreateKernel(program_, "k_box_filter_cost", &err);
-  CL_CHECK(err);
-
-  //Stage 3 kernels: 4-pass bidirectional SGM aggregation
-  kernelAggDir_ = clCreateKernel(program_, "k_sgm_aggregate_dir", &err);
-  CL_CHECK(err);
-
-  //Stage 4 kernels: WTA + Right scatter + LR check
-  kernelLrCheck_ = clCreateKernel(program_, "k_lr_check_packed", &err);
-  CL_CHECK(err);
-  kernelAggBidiAxis_ = clCreateKernel(program_, "k_sgm_bidi_axis", &err);
-  CL_CHECK(err);
-  kernelWtaScatter_ = clCreateKernel(program_, "k_wta_subpixel_and_right_scatter", &err);
-  CL_CHECK(err);
-
-
-}
 
   void SgbmOpenClRunner::allocateBuffers() {
     cl_int err = CL_SUCCESS;
@@ -779,6 +795,7 @@ void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths)
     bufRawBoundsR_     = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes,     nullptr, &err); CL_CHECK(err);
 
     bufPixelCost_      = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
+    bufBoxTemp_        = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
     bufCostL_          = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
     bufAggL_           = clCreateBuffer(context_, CL_MEM_READ_WRITE, aggVolumeBytes,  nullptr, &err); CL_CHECK(err);
 

@@ -153,7 +153,8 @@ class SgbmOpenClRunner {
 
   cl_kernel kernelPrefilter_ = nullptr;
   cl_kernel kernelBtPixel_ = nullptr;
-  cl_kernel kernelBoxFilter_ = nullptr;
+  cl_kernel kernelBoxH_ = nullptr;
+  cl_kernel kernelBoxV_ = nullptr;
   cl_kernel kernelAggDir_ = nullptr;
   cl_kernel kernelWtaSubpixel_ = nullptr;
   cl_kernel kernelRightWta_ = nullptr;
@@ -172,6 +173,7 @@ class SgbmOpenClRunner {
   cl_mem bufRawBoundsR_ = nullptr;
   cl_mem bufCostL_ = nullptr;
   cl_mem bufPixelCost_ = nullptr;
+  cl_mem bufBoxTemp_ = nullptr;
   cl_mem bufAggL_ = nullptr;
   cl_mem bufDispL_ = nullptr;
   cl_mem bufRightMinPacked_ = nullptr;
