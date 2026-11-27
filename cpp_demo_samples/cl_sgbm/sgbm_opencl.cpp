@@ -1,5 +1,13 @@
 
 #include "sgbm_opencl.h"
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
 
 #define CL_CHECK(err)                                                                                                        \
   do {                                                                                                                       \
@@ -47,26 +55,16 @@ SgbmOpenClRunner::~SgbmOpenClRunner() {
 
   if (kernelPrefilter_) clReleaseKernel(kernelPrefilter_);
   if (kernelBtPixel_) clReleaseKernel(kernelBtPixel_);
-  // if (kernelBoxH_) clReleaseKernel(kernelBoxH_);
-  // if (kernelBoxV_) clReleaseKernel(kernelBoxV_);
   if (kernelAggDir_) clReleaseKernel(kernelAggDir_);
-  if (kernelWtaSubpixel_) clReleaseKernel(kernelWtaSubpixel_);
-  if (kernelRightWta_) clReleaseKernel(kernelRightWta_);
   if (kernelLrCheck_) clReleaseKernel(kernelLrCheck_);
 
   if (bufDispL_) clReleaseMemObject(bufDispL_);
   if (bufRightMinPacked_) clReleaseMemObject(bufRightMinPacked_);
-  if (bufBoxTemp_) clReleaseMemObject(bufBoxTemp_);
 
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (context_) clReleaseContext(context_);
 
-  if (bufCostTrans_) clReleaseMemObject(bufCostTrans_);
-  if (bufAggTrans_) clReleaseMemObject(bufAggTrans_);
-  if (kernelTransposeXdToDx_) clReleaseKernel(kernelTransposeXdToDx_);
-  if (kernelColVertDiag_) clReleaseKernel(kernelColVertDiag_);
-  if (kernelAddDxToXd_) clReleaseKernel(kernelAddDxToXd_);
 }
 
 std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& preferredVendor) {
@@ -447,37 +445,12 @@ double SgbmOpenClRunner::runAggregate(int P1, int P2, std::vector<uint16_t>& agg
 
 double SgbmOpenClRunner::runDisparitySelection(const ClSgbmParams& p, std::vector<float>& dispLOut) {
   // 4A. Left WTA + non-adjacent uniqueness + parabolic sub-pixel
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 0, sizeof(cl_mem), &bufAggL_));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 2, sizeof(cl_mem), &bufDispL_));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 3, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 4, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 5, sizeof(int), &p.minDisparity));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 6, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 7, sizeof(int), &p.uniquenessRatio));
-  CL_CHECK(clSetKernelArg(kernelWtaSubpixel_, 8, sizeof(float), &p.invalidDisparity));
-
+  
   const std::array<size_t, 2> wtaLocal = {specs_.sgmWgSize, 1};
   const std::array<size_t, 2> wtaGlobal = {static_cast<size_t>(width_) * specs_.sgmWgSize, static_cast<size_t>(height_)};
 
   cl_event evWtaL = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelWtaSubpixel_, 2, nullptr, wtaGlobal.data(), wtaLocal.data(), 0, nullptr, &evWtaL));
-
-  // 4B. Shared-volume Right WTA
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 0, sizeof(cl_mem), &bufAggL_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 2, sizeof(cl_mem), &bufDispL_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 3, sizeof(cl_mem), &bufRightMinPacked_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 4, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 5, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 6, sizeof(int), &p.minDisparity));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 7, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 8, sizeof(int), &p.disp12MaxDiff));
-  CL_CHECK(clSetKernelArg(kernelRightWta_, 9, sizeof(float), &p.invalidDisparity));
-
-  cl_event evWtaR = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelRightWta_, 2, nullptr, wtaGlobal.data(), wtaLocal.data(), 0, nullptr, &evWtaR));
-
+  
   // 4C. Integer Left-Right consistency check
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 0, sizeof(cl_mem), &bufRightMinPacked_));
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 1, sizeof(cl_mem), &bufDispL_));
@@ -501,7 +474,7 @@ double SgbmOpenClRunner::runDisparitySelection(const ClSgbmParams& p, std::vecto
     return static_cast<double>(t1 - t0) * 1e-6;
   };
 
-  const double wtaLrMs = eventMs(evWtaL) + eventMs(evWtaR) + eventMs(evLr);
+  const double wtaLrMs =  eventMs(evLr);
 
   // Zero-copy map/read final 1.86 MB dispL buffer
   cl_int err = CL_SUCCESS;
@@ -744,11 +717,6 @@ void SgbmOpenClRunner::allocateBuffers() {
   bufRightMinPacked_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, packedBytes, nullptr, &err);
   CL_CHECK(err);
   bufDispL_ = clCreateBuffer(context_, CL_MEM_WRITE_ONLY, dispBytes, nullptr, &err);
-  CL_CHECK(err);
-
-  bufCostTrans_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err);
-  CL_CHECK(err);
-  bufAggTrans_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, aggVolumeBytes, nullptr, &err);
   CL_CHECK(err);
 }
 

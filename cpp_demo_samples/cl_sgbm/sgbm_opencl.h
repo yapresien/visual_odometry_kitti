@@ -1,3 +1,5 @@
+#pragma once
+
 #ifndef OPENCL_TARGET_VERSION
 #define OPENCL_TARGET_VERSION 120
 #endif
@@ -5,15 +7,9 @@
 #include <CL/cl.h>
 
 #include <array>
-#include <cassert>
-#include <chrono>
-#include <cmath>
-#include <cstring>
-#include <fstream>
-#include <iostream>
-#include <sstream>
-#include <stdexcept>
+#include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct DeviceSpecs {
@@ -34,23 +30,11 @@ struct DeviceSpecs {
 };
 
 struct TuningConfig {
-  size_t overrideWarpWidth = 0;              // 0 = auto-detect via CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE
-  size_t overrideWgSize = 0;                 // 0 = auto-select (e.g., 256)
-  size_t overrideSgmScanWgSize = 0;          // 0 = auto-match warpWidth (32 or 64)
-  int maxBlockSize = 9;                      // Sets LDS apron allocation size
-  std::string preferredVendor = "";          // "" = auto-select, or "NVIDIA", "Intel", "AMD", etc.
-  bool enableSobelBounds = true;             // Enable/disable Sobel bounds optimization
-  bool enableRawBounds = true;               // Enable/disable raw bounds optimization
-  bool enableBoxCostBounds = true;           // Enable/disable box cost bounds optimization
-  bool enableSgmBounds = true;               // Enable/disable SGM bounds optimization
-  bool enableSgmScanBounds = true;           // Enable/disable SGM scan bounds
-  bool enableSgmScanWarpSync = true;         // Enable/disable warp-synchronous SGM scan (requires warp-synchronous scan support)
-  bool enableSgmScanWarpShuffle = true;      // Enable/disable warp-shuffle SGM scan (requires warp-synchronous scan support)
-  bool enableSgmScanWarpShuffleXor = true;   // Enable/disable warp-shuffle-xor SGM scan (requires warp-synchronous scan support)
-  bool enableSgmScanWarpShuffleXor2 = true;  // Enable/disable warp-shuffle-xor2 SGM scan (requires warp-synchronous scan support)
-  bool enableSgmScanWarpShuffleXor3 = true;  // Enable/disable warp-shuffle-xor3 SGM scan (requires warp-synchronous scan support)
-  bool enableSgmScanWarpShuffleXor4 = true;  // Enable/disable warp-shuffle-xor4 SGM scan (requires warp-synchronous scan support)
-  bool enableSgmScanWarpShuffleXor5 = true;  // Enable/disable warp-shuffle-xor5 SGM scan (requires warp-synchronous scan support)
+  size_t overrideWarpWidth = 0;      // 0 = auto-detect via CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE
+  size_t overrideWgSize = 0;         // 0 = auto-select (e.g., 256)
+  size_t overrideSgmScanWgSize = 0;  // 0 = auto-match warpWidth (32 or 64)
+  int maxBlockSize = 9;              // Sets LDS apron allocation size
+  std::string preferredVendor = "";  // "" = auto-select, or "AMD", "NVIDIA", "Intel"
 };
 
 struct ClSgbmTimings {
@@ -74,43 +58,69 @@ struct ClSgbmParams {
   int speckleRange = 2;
   int disp12MaxDiff = 1;
   float invalidDisparity = -1.0f;
-  int sgmPaths = 4;  // 4 = libSGM/CUDA 4-path (40+ FPS), 5 = MODE_SGBM, 8 = MODE_HH
+  int sgmPaths = 5;  // 4 = 4-path, 5 = MODE_SGBM (default), 8 = MODE_HH
 };
 
 class SgbmOpenClRunner {
  public:
-  SgbmOpenClRunner(const std::vector<std::string>&, int, int, int, const TuningConfig& tuning = TuningConfig{});
+  SgbmOpenClRunner(
+      const std::vector<std::string>& clFilePaths,
+      int width,
+      int height,
+      int numDisparities,
+      const TuningConfig& tuning = TuningConfig{});
 
   ~SgbmOpenClRunner();
 
-  std::vector<cl_device_id> selectDevice(const std::string& preferredVendor = "");
+  SgbmOpenClRunner(const SgbmOpenClRunner&) = delete;
+  SgbmOpenClRunner& operator=(const SgbmOpenClRunner&) = delete;
 
-  void refineWarpWidthFromKernel();
+  const DeviceSpecs& deviceSpecs() const noexcept { return specs_; }
 
-  DeviceSpecs queryAndTuneDevice(cl_device_id device, const TuningConfig& cfg);
+  void compute(
+      const std::vector<uint8_t>& rawLeft,
+      const std::vector<uint8_t>& rawRight,
+      const ClSgbmParams& p,
+      std::vector<float>& dispLOut,
+      ClSgbmTimings& timings);
 
-  double runPrefilter(const std::vector<uint8_t>& rawLeft, int preFilterCap, std::vector<int16_t>& sobelOut, std::vector<cl_short2>& sobelBoundsOut, std::vector<cl_short2>& rawBoundsOut);
+  // Stage-level benchmarking / unit-test entry points
+  double runPrefilter(
+      const std::vector<uint8_t>& rawLeft,
+      int preFilterCap,
+      std::vector<int16_t>& sobelOut,
+      std::vector<cl_short2>& sobelBoundsOut,
+      std::vector<cl_short2>& rawBoundsOut);
 
-  double runBoxCost(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, int preFilterCap, int minDisparity, int blockSize, std::vector<short>& costOut);
+  double runBoxCost(
+      const std::vector<uint8_t>& rawLeft,
+      const std::vector<uint8_t>& rawRight,
+      int preFilterCap,
+      int minDisparity,
+      int blockSize,
+      std::vector<short>& costOut);
 
   double runAggregate(int P1, int P2, std::vector<uint16_t>& aggOut);
 
   double runDisparitySelection(const ClSgbmParams& p, std::vector<float>& dispLOut);
 
-  void compute(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, const ClSgbmParams& p, std::vector<float>& dispLOut, ClSgbmTimings& timings);
-
  private:
+  std::vector<cl_device_id> selectDevice(const std::string& preferredVendor = "");
   void initContextAndQueue();
-
+  DeviceSpecs queryAndTuneDevice(cl_device_id device, const TuningConfig& cfg);
   std::string detectOpenClCStandard(cl_device_id device);
-
   std::string buildCompilerOptions(const DeviceSpecs& specs, const TuningConfig& cfg, int numDisparities);
-
   void buildProgram(const std::vector<std::string>& clFilePaths);
-
+  void refineWarpWidthFromKernel();
   void allocateBuffers();
 
-  void speckleFilterHost(std::vector<float>& disp, int width, int height, int speckleWindowSize, int speckleRange, float invalidDisparity);
+  void speckleFilterHost(
+      std::vector<float>& disp,
+      int width,
+      int height,
+      int speckleWindowSize,
+      int speckleRange,
+      float invalidDisparity);
 
  private:
   int width_ = 0;
@@ -124,23 +134,17 @@ class SgbmOpenClRunner {
   cl_command_queue queue_ = nullptr;
   cl_program program_ = nullptr;
 
+  // Active OpenCL kernels
   cl_kernel kernelPrefilter_ = nullptr;
   cl_kernel kernelBtPixel_ = nullptr;
   cl_kernel kernelBoxFilter_ = nullptr;
-  cl_kernel kernelTransposeXdToDx_ = nullptr;
-  cl_kernel kernelColVertDiag_ = nullptr;
-  cl_kernel kernelAddDxToXd_ = nullptr;
-
-  //   cl_kernel kernelBoxH_ = nullptr;
-  //   cl_kernel kernelBoxV_ = nullptr;
   cl_kernel kernelAggDir_ = nullptr;
-  cl_kernel kernelWtaSubpixel_ = nullptr;
-  cl_kernel kernelRightWta_ = nullptr;
-  cl_kernel kernelLrCheck_ = nullptr;
   cl_kernel kernelAggBidiAxis_ = nullptr;
-  cl_kernel kernelWtaScatter_ = nullptr;
   cl_kernel kernelClearUint_ = nullptr;
+  cl_kernel kernelWtaScatter_ = nullptr;
+  cl_kernel kernelLrCheck_ = nullptr;
 
+  // Active OpenCL device buffers
   cl_mem bufRawL_ = nullptr;
   cl_mem bufRawR_ = nullptr;
   cl_mem bufSobelL_ = nullptr;
@@ -149,25 +153,17 @@ class SgbmOpenClRunner {
   cl_mem bufSobelBoundsR_ = nullptr;
   cl_mem bufRawBoundsL_ = nullptr;
   cl_mem bufRawBoundsR_ = nullptr;
-  cl_mem bufCostL_ = nullptr;
   cl_mem bufPixelCost_ = nullptr;
-  cl_mem bufBoxTemp_ = nullptr;
+  cl_mem bufCostL_ = nullptr;
   cl_mem bufAggL_ = nullptr;
-  cl_mem bufDispL_ = nullptr;
   cl_mem bufRightMinPacked_ = nullptr;
-
-  cl_mem bufRowPrevTB_ = nullptr;
-  cl_mem bufRowPrevDL_ = nullptr;
-  cl_mem bufRowPrevDR_ = nullptr;
-  cl_mem bufRowCurrTB_ = nullptr;
-  cl_mem bufRowCurrDL_ = nullptr;
-  cl_mem bufRowCurrDR_ = nullptr;
-  cl_mem bufCostTrans_ = nullptr;
-  cl_mem bufAggTrans_ = nullptr;
+  cl_mem bufDispL_ = nullptr;
 
   DeviceSpecs specs_;
   TuningConfig tuningConfig_;
   std::vector<std::string> clFilePaths_;
+
+  // Reusable scratch memory for host connected-component speckle filtering
   std::vector<uint8_t> speckleVisited_;
   std::vector<std::pair<int, int>> speckleStack_;
   std::vector<std::pair<int, int>> speckleComponent_;
