@@ -73,36 +73,9 @@ struct ClSgbmParams {
   int speckleWindowSize = 100;
   int speckleRange = 2;
   int disp12MaxDiff = 1;
-  float invalidDisparity = -1.0f;  // Match sgbm::kInvalidDisparity
-  bool full8Paths = false;
+  float invalidDisparity = -1.0f;
+  int sgmPaths = 4;  // 4 = libSGM/CUDA 4-path (40+ FPS), 5 = MODE_SGBM, 8 = MODE_HH
 };
-
-
-// Add this small helper struct inside SgbmOpenClRunner (or above it):
-struct AlignedHostMem {
-  void* ptr = nullptr;
-  size_t bytes = 0;
-
-  void allocate(size_t reqBytes, size_t alignment = 256) {
-    release();
-    bytes = ((reqBytes + alignment - 1) / alignment) * alignment;
-    if (posix_memalign(&ptr, alignment, bytes) != 0 || !ptr) {
-      throw std::bad_alloc();
-    }
-    std::memset(ptr, 0, bytes);
-  }
-
-  void release() {
-    if (ptr) {
-      std::free(ptr);
-      ptr = nullptr;
-      bytes = 0;
-    }
-  }
-
-  ~AlignedHostMem() { release(); }
-};
-
 
 class SgbmOpenClRunner {
  public:
@@ -153,8 +126,13 @@ class SgbmOpenClRunner {
 
   cl_kernel kernelPrefilter_ = nullptr;
   cl_kernel kernelBtPixel_ = nullptr;
-  cl_kernel kernelBoxH_ = nullptr;
-  cl_kernel kernelBoxV_ = nullptr;
+  cl_kernel kernelBoxFilter_ = nullptr;
+  cl_kernel kernelTransposeXdToDx_ = nullptr;
+  cl_kernel kernelColVertDiag_ = nullptr;
+  cl_kernel kernelAddDxToXd_ = nullptr;
+
+  //   cl_kernel kernelBoxH_ = nullptr;
+  //   cl_kernel kernelBoxV_ = nullptr;
   cl_kernel kernelAggDir_ = nullptr;
   cl_kernel kernelWtaSubpixel_ = nullptr;
   cl_kernel kernelRightWta_ = nullptr;
@@ -184,6 +162,8 @@ class SgbmOpenClRunner {
   cl_mem bufRowCurrTB_ = nullptr;
   cl_mem bufRowCurrDL_ = nullptr;
   cl_mem bufRowCurrDR_ = nullptr;
+  cl_mem bufCostTrans_ = nullptr;
+  cl_mem bufAggTrans_ = nullptr;
 
   DeviceSpecs specs_;
   TuningConfig tuningConfig_;
@@ -191,5 +171,4 @@ class SgbmOpenClRunner {
   std::vector<uint8_t> speckleVisited_;
   std::vector<std::pair<int, int>> speckleStack_;
   std::vector<std::pair<int, int>> speckleComponent_;
-
 };

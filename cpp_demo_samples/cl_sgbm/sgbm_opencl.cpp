@@ -9,22 +9,21 @@
     }                                                                                                                        \
   } while (0)
 
-  static std::string KernelLanguageOption()
-{
+static std::string KernelLanguageOption() {
 #if OPENCL_TARGET_VERSION >= 300
-    return "-cl-std=CL3.0";
+  return "-cl-std=CL3.0";
 #elif OPENCL_TARGET_VERSION >= 200
-    return "-cl-std=CL2.0";
+  return "-cl-std=CL2.0";
 #elif OPENCL_TARGET_VERSION >= 120
-    return "-cl-std=CL1.2";
+  return "-cl-std=CL1.2";
 #elif OPENCL_TARGET_VERSION >= 110
-    return "-cl-std=CL1.1";
+  return "-cl-std=CL1.1";
 #else
-    return "-cl-std=CL1.0";
+  return "-cl-std=CL1.0";
 #endif
 }
 
-SgbmOpenClRunner::SgbmOpenClRunner(const std::vector<std::string>& clFilePaths, int width, int height, int numDisparities, const TuningConfig& tuning ) : clFilePaths_(clFilePaths), width_(width), height_(height), numDisparities_(numDisparities), numPixels_(static_cast<size_t>(width) * height), tuningConfig_(tuning) {
+SgbmOpenClRunner::SgbmOpenClRunner(const std::vector<std::string>& clFilePaths, int width, int height, int numDisparities, const TuningConfig& tuning) : clFilePaths_(clFilePaths), width_(width), height_(height), numDisparities_(numDisparities), numPixels_(static_cast<size_t>(width) * height), tuningConfig_(tuning) {
   if (width_ <= 0 || height_ <= 0 || numDisparities_ <= 0) {
     throw std::invalid_argument("Invalid image dimensions or numDisparities");
   }
@@ -44,12 +43,12 @@ SgbmOpenClRunner::~SgbmOpenClRunner() {
   if (bufSobelL_) clReleaseMemObject(bufSobelL_);
   if (bufSobelBoundsL_) clReleaseMemObject(bufSobelBoundsL_);
   if (bufRawBoundsL_) clReleaseMemObject(bufRawBoundsL_);
-  if(kernelClearUint_) clReleaseKernel(kernelClearUint_);
+  if (kernelClearUint_) clReleaseKernel(kernelClearUint_);
 
   if (kernelPrefilter_) clReleaseKernel(kernelPrefilter_);
   if (kernelBtPixel_) clReleaseKernel(kernelBtPixel_);
-  if (kernelBoxH_) clReleaseKernel(kernelBoxH_);
-  if (kernelBoxV_) clReleaseKernel(kernelBoxV_);
+  // if (kernelBoxH_) clReleaseKernel(kernelBoxH_);
+  // if (kernelBoxV_) clReleaseKernel(kernelBoxV_);
   if (kernelAggDir_) clReleaseKernel(kernelAggDir_);
   if (kernelWtaSubpixel_) clReleaseKernel(kernelWtaSubpixel_);
   if (kernelRightWta_) clReleaseKernel(kernelRightWta_);
@@ -57,13 +56,56 @@ SgbmOpenClRunner::~SgbmOpenClRunner() {
 
   if (bufDispL_) clReleaseMemObject(bufDispL_);
   if (bufRightMinPacked_) clReleaseMemObject(bufRightMinPacked_);
-  if(bufBoxTemp_) clReleaseMemObject(bufBoxTemp_);
+  if (bufBoxTemp_) clReleaseMemObject(bufBoxTemp_);
 
   if (program_) clReleaseProgram(program_);
   if (queue_) clReleaseCommandQueue(queue_);
   if (context_) clReleaseContext(context_);
+
+  if (bufCostTrans_) clReleaseMemObject(bufCostTrans_);
+  if (bufAggTrans_) clReleaseMemObject(bufAggTrans_);
+  if (kernelTransposeXdToDx_) clReleaseKernel(kernelTransposeXdToDx_);
+  if (kernelColVertDiag_) clReleaseKernel(kernelColVertDiag_);
+  if (kernelAddDxToXd_) clReleaseKernel(kernelAddDxToXd_);
 }
 
+std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& preferredVendor) {
+  cl_uint numPlatforms = 0;
+  CL_CHECK(clGetPlatformIDs(0, nullptr, &numPlatforms));
+  if (numPlatforms == 0) throw std::runtime_error("No OpenCL platforms found");
+
+  std::vector<cl_platform_id> platforms(numPlatforms);
+  CL_CHECK(clGetPlatformIDs(numPlatforms, platforms.data(), nullptr));
+
+  cl_device_id fallbackGpu = nullptr;
+
+  for (auto plat : platforms) {
+    cl_uint numDevices = 0;
+    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) {
+      continue;
+    }
+
+    std::vector<cl_device_id> devices(numDevices);
+    CL_CHECK(clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, numDevices, devices.data(), nullptr));
+
+    std::array<char, 256> vendor{};
+    clGetPlatformInfo(plat, CL_PLATFORM_VENDOR, vendor.size(), vendor.data(), nullptr);
+    const std::string vendorStr(vendor.data());
+
+    if (!preferredVendor.empty() && vendorStr.find(preferredVendor) != std::string::npos) {
+      platform_ = plat;
+      return devices;
+    }
+
+    if (!fallbackGpu) {
+      platform_ = plat;
+      fallbackGpu = devices[0];
+    }
+  }
+
+  if (!fallbackGpu) throw std::runtime_error("No OpenCL GPU device found");
+  return {fallbackGpu};
+}
 
 std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
   std::array<char, 128> cVer{};
@@ -127,10 +169,9 @@ void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths)
   std::string buildOpts = KernelLanguageOption();
 
   auto cflags = buildCompilerOptions(specs_, tuningConfig_, numDisparities_);  // Generate additional build options based on device specs and tuning
-  if (!cflags.empty())
-  {
-      buildOpts += " ";
-      buildOpts += cflags;
+  if (!cflags.empty()) {
+    buildOpts += " ";
+    buildOpts += cflags;
   }
   std::cout << "Building OpenCL program with options: " << buildOpts << std::endl;
 
@@ -143,74 +184,31 @@ void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths)
     std::cerr << "OpenCL Build Log:\n" << buildLog << "\n";
     CL_CHECK(err);
   }
-  
-  //Stage 1 kernels: Prefilter + BT bounds
+
+  // Stage 1 kernels: Prefilter + BT bounds
   kernelClearUint_ = clCreateKernel(program_, "k_clear_uint", &err);
   CL_CHECK(err);
 
   kernelPrefilter_ = clCreateKernel(program_, "k_prefilter_and_bt_bounds", &err);
   CL_CHECK(err);
 
-  //Stage 2 kernels: BT pixel cost + box filter cost
+  // Stage 2 kernels: BT pixel cost + box filter cost
   kernelBtPixel_ = clCreateKernel(program_, "k_bt_pixel_cost", &err);
   CL_CHECK(err);
-  kernelBoxH_ = clCreateKernel(program_, "k_box_filter_h", &err);
-  CL_CHECK(err);
-  kernelBoxV_ = clCreateKernel(program_, "k_box_filter_v", &err);
+  kernelBoxFilter_ = clCreateKernel(program_, "k_box_filter_cost", &err);
   CL_CHECK(err);
 
-  //Stage 3 kernels: 4-pass bidirectional SGM aggregation
+  // Stage 3 kernels: 4-pass bidirectional SGM aggregation
   kernelAggDir_ = clCreateKernel(program_, "k_sgm_aggregate_dir", &err);
   CL_CHECK(err);
 
-  //Stage 4 kernels: WTA + Right scatter + LR check
+  // Stage 4 kernels: WTA + Right scatter + LR check
   kernelLrCheck_ = clCreateKernel(program_, "k_lr_check_packed", &err);
   CL_CHECK(err);
   kernelAggBidiAxis_ = clCreateKernel(program_, "k_sgm_bidi_axis", &err);
   CL_CHECK(err);
   kernelWtaScatter_ = clCreateKernel(program_, "k_wta_subpixel_and_right_scatter", &err);
   CL_CHECK(err);
-
-
-}
-
-
-std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& preferredVendor ) {
-  cl_uint numPlatforms = 0;
-  CL_CHECK(clGetPlatformIDs(0, nullptr, &numPlatforms));
-  if (numPlatforms == 0) throw std::runtime_error("No OpenCL platforms found");
-
-  std::vector<cl_platform_id> platforms(numPlatforms);
-  CL_CHECK(clGetPlatformIDs(numPlatforms, platforms.data(), nullptr));
-
-  cl_device_id fallbackGpu = nullptr;
-
-  for (auto plat : platforms) {
-    cl_uint numDevices = 0;
-    if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) {
-      continue;
-    }
-
-    std::vector<cl_device_id> devices(numDevices);
-    CL_CHECK(clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, numDevices, devices.data(), nullptr));
-
-    std::array<char, 256> vendor{};
-    clGetPlatformInfo(plat, CL_PLATFORM_VENDOR, vendor.size(), vendor.data(), nullptr);
-    const std::string vendorStr(vendor.data());
-
-    if (!preferredVendor.empty() && vendorStr.find(preferredVendor) != std::string::npos) {
-      platform_ = plat;
-      return devices;
-    }
-
-    if (!fallbackGpu) {
-      platform_ = plat;
-      fallbackGpu = devices[0];
-    }
-  }
-
-  if (!fallbackGpu) throw std::runtime_error("No OpenCL GPU device found");
-  return {fallbackGpu};
 }
 
 void SgbmOpenClRunner::refineWarpWidthFromKernel() {
@@ -223,8 +221,7 @@ void SgbmOpenClRunner::refineWarpWidthFromKernel() {
     tuningConfig_.overrideWarpWidth = hwWarpWidth;
     specs_ = queryAndTuneDevice(device_, tuningConfig_);
     // Release old program/kernels and rebuild with exact hardware warp width
-    clReleaseKernel(kernelBoxH_);
-    clReleaseKernel(kernelBoxV_);
+    clReleaseKernel(kernelBoxFilter_);
     clReleaseKernel(kernelBtPixel_);
     clReleaseKernel(kernelPrefilter_);
     clReleaseKernel(kernelAggDir_);
@@ -368,20 +365,19 @@ double SgbmOpenClRunner::runBoxCost(const std::vector<uint8_t>& rawLeft, const s
   CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBtPixel_, 3, nullptr, stage2Global_bt.data(), stage2Local_bt.data(), 0, nullptr, &btEvent));
 
   // 3B. Dispatch Kernel 2B: k_box_filter_cost (32x8 = 256 threads/WG)
-  assert(kernelBoxH_);
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 0, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 4, sizeof(int), &minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 5, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 6, sizeof(int), &blockSize));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 0, sizeof(cl_mem), &bufPixelCost_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 1, sizeof(cl_mem), &bufCostL_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 2, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 3, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 4, sizeof(int), &minDisparity));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 5, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 6, sizeof(int), &blockSize));
 
   const std::array<size_t, 3> stage2Local_box = {specs_.costWgW, specs_.costWgH, 1};
   const std::array<size_t, 3> stage2Global_box = {static_cast<size_t>((width_ + specs_.costWgW - 1) / specs_.costWgW) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
 
   cl_event boxEvent = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxH_, 3, nullptr, stage2Global_box.data(), stage2Local_box.data(), 0, nullptr, &boxEvent));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxFilter_, 3, nullptr, stage2Global_box.data(), stage2Local_box.data(), 0, nullptr, &boxEvent));
   CL_CHECK(clFinish(queue_));
 
   cl_ulong t0 = 0, t1 = 0, t2 = 0, t3 = 0;
@@ -524,12 +520,7 @@ double SgbmOpenClRunner::runDisparitySelection(const ClSgbmParams& p, std::vecto
   return wtaLrMs;
 }
 
-void SgbmOpenClRunner::compute(
-    const std::vector<uint8_t>& rawLeft,
-    const std::vector<uint8_t>& rawRight,
-    const ClSgbmParams& p,
-    std::vector<float>& dispLOut,
-    ClSgbmTimings& timings) {
+void SgbmOpenClRunner::compute(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, const ClSgbmParams& p, std::vector<float>& dispLOut, ClSgbmTimings& timings) {
   const auto tWallStart = std::chrono::steady_clock::now();
 
   auto eventMs = [](cl_event ev) {
@@ -542,16 +533,12 @@ void SgbmOpenClRunner::compute(
   };
 
   // 1. Non-blocking image uploads (zero map/unmap page-table faults)
-  CL_CHECK(clEnqueueWriteBuffer(
-      queue_, bufRawL_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawLeft.data(), 0, nullptr, nullptr));
-  CL_CHECK(clEnqueueWriteBuffer(
-      queue_, bufRawR_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawRight.data(), 0, nullptr, nullptr));
+  CL_CHECK(clEnqueueWriteBuffer(queue_, bufRawL_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawLeft.data(), 0, nullptr, nullptr));
+  CL_CHECK(clEnqueueWriteBuffer(queue_, bufRawR_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawRight.data(), 0, nullptr, nullptr));
 
   // 2. Stage 1: Prefilter + Birchfield-Tomasi Bounds (Left & Right)
   const std::array<size_t, 2> pfLocal = {specs_.pfWgW, specs_.pfWgH};
-  const std::array<size_t, 2> pfGlobal = {
-      ((static_cast<size_t>(width_) + specs_.pfWgW - 1) / specs_.pfWgW) * specs_.pfWgW,
-      ((static_cast<size_t>(height_) + specs_.pfWgH - 1) / specs_.pfWgH) * specs_.pfWgH};
+  const std::array<size_t, 2> pfGlobal = {((static_cast<size_t>(width_) + specs_.pfWgW - 1) / specs_.pfWgW) * specs_.pfWgW, ((static_cast<size_t>(height_) + specs_.pfWgH - 1) / specs_.pfWgH) * specs_.pfWgH};
 
   cl_event evPfL = nullptr, evPfR = nullptr;
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 0, sizeof(cl_mem), &bufRawL_));
@@ -561,8 +548,7 @@ void SgbmOpenClRunner::compute(
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 4, sizeof(int), &width_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 5, sizeof(int), &height_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 6, sizeof(int), &p.preFilterCap));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, &evPfL));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, &evPfL));
 
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 0, sizeof(cl_mem), &bufRawR_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 1, sizeof(cl_mem), &bufSobelR_));
@@ -571,17 +557,13 @@ void SgbmOpenClRunner::compute(
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 4, sizeof(int), &width_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 5, sizeof(int), &height_));
   CL_CHECK(clSetKernelArg(kernelPrefilter_, 6, sizeof(int), &p.preFilterCap));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, &evPfR));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelPrefilter_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, &evPfR));
 
   // 3. Stage 2: 8-bit Dual-BT Pixel Cost + BxB Box Filter
   const std::array<size_t, 3> stage2Local = {specs_.costWgW, specs_.costWgH, 1};
-  const std::array<size_t, 3> stage2Global = {
-      ((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.costWgW,
-      static_cast<size_t>(height_) * specs_.costWgH,
-      1};
+  const std::array<size_t, 3> stage2Global = {((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.costWgW, static_cast<size_t>(height_) * specs_.costWgH, 1};
 
-  cl_event evBt = nullptr, evBoxH = nullptr, evBoxV = nullptr;
+  cl_event evBt = nullptr, evBox = nullptr;
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 0, sizeof(cl_mem), &bufRawL_));
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 1, sizeof(cl_mem), &bufRawR_));
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 2, sizeof(cl_mem), &bufSobelL_));
@@ -595,29 +577,16 @@ void SgbmOpenClRunner::compute(
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 10, sizeof(int), &height_));
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 11, sizeof(int), &p.minDisparity));
   CL_CHECK(clSetKernelArg(kernelBtPixel_, 12, sizeof(int), &numDisparities_));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelBtPixel_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBt));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBtPixel_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBt));
 
-
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 0, sizeof(cl_mem), &bufPixelCost_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 1, sizeof(cl_mem), &bufBoxTemp_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 4, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxH_, 5, sizeof(int), &p.blockSize));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelBoxH_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBoxH));
-
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 0, sizeof(cl_mem), &bufBoxTemp_));
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 1, sizeof(cl_mem), &bufCostL_));
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 2, sizeof(int), &width_));
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 3, sizeof(int), &height_));
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 4, sizeof(int), &p.minDisparity));
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 5, sizeof(int), &numDisparities_));
-  CL_CHECK(clSetKernelArg(kernelBoxV_, 6, sizeof(int), &p.blockSize));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelBoxV_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBoxV));
-
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 0, sizeof(cl_mem), &bufPixelCost_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 1, sizeof(cl_mem), &bufCostL_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 2, sizeof(int), &width_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 3, sizeof(int), &height_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 4, sizeof(int), &p.minDisparity));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 5, sizeof(int), &numDisparities_));
+  CL_CHECK(clSetKernelArg(kernelBoxFilter_, 6, sizeof(int), &p.blockSize));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelBoxFilter_, 3, nullptr, stage2Global.data(), stage2Local.data(), 0, nullptr, &evBox));
 
   // 4. Stage 3: 4-Pass Bidirectional 256-Thread SGM Aggregation
   struct Axis {
@@ -627,13 +596,8 @@ void SgbmOpenClRunner::compute(
     int doBackward;
   };
 
-  const int doBwd = p.full8Paths ? 1 : 0;
-  const std::array<Axis, 4> axes = {{
-      {1,  0, static_cast<size_t>(height_), 1},
-      {0,  1, static_cast<size_t>(width_), doBwd},
-      {1,  1, static_cast<size_t>(width_ + height_ - 1), doBwd},
-      {-1, 1, static_cast<size_t>(width_ + height_ - 1), doBwd}
-  }};
+  const int doBwd = p.sgmPaths >= 8 ? 1 : 0;
+  const std::array<Axis, 4> axes = {{{1, 0, static_cast<size_t>(height_), 1}, {0, 1, static_cast<size_t>(width_), doBwd}, {1, 1, static_cast<size_t>(width_ + height_ - 1), doBwd}, {-1, 1, static_cast<size_t>(width_ + height_ - 1), doBwd}}};
 
   CL_CHECK(clSetKernelArg(kernelAggBidiAxis_, 0, sizeof(cl_mem), &bufCostL_));
   CL_CHECK(clSetKernelArg(kernelAggBidiAxis_, 1, sizeof(cl_mem), &bufAggL_));
@@ -653,15 +617,12 @@ void SgbmOpenClRunner::compute(
     CL_CHECK(clSetKernelArg(kernelAggBidiAxis_, 9, sizeof(int), &isFirst));
     CL_CHECK(clSetKernelArg(kernelAggBidiAxis_, 10, sizeof(int), &axes[i].doBackward));
 
-    const std::array<size_t, 2> aggGlobal = {
-        ((axes[i].numScanlines + specs_.costWgH - 1) / specs_.costWgH) * specs_.sgmWgSize,
-        specs_.costWgH};
+    const std::array<size_t, 2> aggGlobal = {((axes[i].numScanlines + specs_.costWgH - 1) / specs_.costWgH) * specs_.sgmWgSize, specs_.costWgH};
 
-    CL_CHECK(clEnqueueNDRangeKernel(
-        queue_, kernelAggBidiAxis_, 2, nullptr, aggGlobal.data(), aggLocal.data(), 0, nullptr, &evAxes[i]));
+    CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelAggBidiAxis_, 2, nullptr, aggGlobal.data(), aggLocal.data(), 0, nullptr, &evAxes[i]));
   }
 
-  // 5. Stage 4: Compute Clear (Zero SDMA) -> Fused Left WTA + Right Scatter -> LR Check
+  // 5. Stage 4: Compute Clear -> Fused Left WTA + Right Scatter -> LR Consistency Check
   const cl_uint fillSentinel = 0xFFFFFFFFu;
   const cl_uint pixCount = static_cast<cl_uint>(numPixels_);
   CL_CHECK(clSetKernelArg(kernelClearUint_, 0, sizeof(cl_mem), &bufRightMinPacked_));
@@ -670,13 +631,10 @@ void SgbmOpenClRunner::compute(
   const size_t clearLocal = 256;
   const size_t clearGlobal = ((numPixels_ + 255) / 256) * 256;
   cl_event evClear = nullptr, evWta = nullptr, evLr = nullptr;
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelClearUint_, 1, nullptr, &clearGlobal, &clearLocal, 0, nullptr, &evClear));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelClearUint_, 1, nullptr, &clearGlobal, &clearLocal, 0, nullptr, &evClear));
 
   const std::array<size_t, 2> wtaLocal = {specs_.sgmWgSize, specs_.costWgH};
-  const std::array<size_t, 2> wtaGlobal = {
-      ((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.sgmWgSize,
-      static_cast<size_t>(height_) * specs_.costWgH};
+  const std::array<size_t, 2> wtaGlobal = {((static_cast<size_t>(width_) + specs_.costWgH - 1) / specs_.costWgH) * specs_.sgmWgSize, static_cast<size_t>(height_) * specs_.costWgH};
 
   CL_CHECK(clSetKernelArg(kernelWtaScatter_, 0, sizeof(cl_mem), &bufAggL_));
   CL_CHECK(clSetKernelArg(kernelWtaScatter_, 1, sizeof(cl_mem), &bufCostL_));
@@ -688,8 +646,7 @@ void SgbmOpenClRunner::compute(
   CL_CHECK(clSetKernelArg(kernelWtaScatter_, 7, sizeof(int), &numDisparities_));
   CL_CHECK(clSetKernelArg(kernelWtaScatter_, 8, sizeof(int), &p.uniquenessRatio));
   CL_CHECK(clSetKernelArg(kernelWtaScatter_, 9, sizeof(float), &p.invalidDisparity));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelWtaScatter_, 2, nullptr, wtaGlobal.data(), wtaLocal.data(), 0, nullptr, &evWta));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelWtaScatter_, 2, nullptr, wtaGlobal.data(), wtaLocal.data(), 0, nullptr, &evWta));
 
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 0, sizeof(cl_mem), &bufRightMinPacked_));
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 1, sizeof(cl_mem), &bufDispL_));
@@ -698,22 +655,20 @@ void SgbmOpenClRunner::compute(
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 4, sizeof(int), &p.minDisparity));
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 5, sizeof(int), &p.disp12MaxDiff));
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 6, sizeof(float), &p.invalidDisparity));
-  CL_CHECK(clEnqueueNDRangeKernel(
-      queue_, kernelLrCheck_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, &evLr));
+  CL_CHECK(clEnqueueNDRangeKernel(queue_, kernelLrCheck_, 2, nullptr, pfGlobal.data(), pfLocal.data(), 0, nullptr, &evLr));
 
-  // 6. Blocking Readback (implicitly drains queue_ cleanly without separate clFinish)
+  // 6. Blocking Readback (implicitly drains queue_ cleanly)
   dispLOut.resize(numPixels_);
-  CL_CHECK(clEnqueueReadBuffer(
-      queue_, bufDispL_, CL_TRUE, 0, numPixels_ * sizeof(float), dispLOut.data(), 0, nullptr, nullptr));
+  CL_CHECK(clEnqueueReadBuffer(queue_, bufDispL_, CL_TRUE, 0, numPixels_ * sizeof(float), dispLOut.data(), 0, nullptr, nullptr));
 
   // Record accurate per-stage GPU profiling timestamps
   timings.prefilterMs = eventMs(evPfL) + eventMs(evPfR);
-  timings.costVolumeMs = eventMs(evBt) + eventMs(evBoxH ) + eventMs(evBoxV);
+  timings.costVolumeMs = eventMs(evBt) + eventMs(evBox);
   timings.aggregationMs = 0.0;
   for (auto& ev : evAxes) timings.aggregationMs += eventMs(ev);
   timings.wtaLrMs = eventMs(evClear) + eventMs(evWta) + eventMs(evLr);
   timings.totalGpuKernelMs = timings.prefilterMs + timings.costVolumeMs + timings.aggregationMs + timings.wtaLrMs;
-  // 7. Host speckle filter
+  // 7. Host speckle filter (~0.68 ms in -O3 Release)
   const auto tSp0 = std::chrono::steady_clock::now();
   speckleFilterHost(dispLOut, width_, height_, p.speckleWindowSize, p.speckleRange, p.invalidDisparity);
   const auto tSp1 = std::chrono::steady_clock::now();
@@ -721,88 +676,81 @@ void SgbmOpenClRunner::compute(
   timings.endToEndMs = std::chrono::duration<double, std::milli>(tSp1 - tWallStart).count();
 }
 
-void SgbmOpenClRunner::initContextAndQueue()
-{
-    cl_int err = CL_SUCCESS;
+void SgbmOpenClRunner::initContextAndQueue() {
+  cl_int err = CL_SUCCESS;
 
-    context_ =
-        clCreateContext(
-            nullptr,
-            1,
-            &device_,
-            nullptr,
-            nullptr,
-            &err);
+  context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, &err);
 
-    CL_CHECK(err);
+  CL_CHECK(err);
 
 #if CL_TARGET_OPENCL_VERSION >= 200
 
-    const cl_queue_properties props[] =
-    {
-        CL_QUEUE_PROPERTIES,
-        CL_QUEUE_PROFILING_ENABLE,
-        0
-    };
+  const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
 
-    queue_ =
-        clCreateCommandQueueWithProperties(
-            context_,
-            device_,
-            props,
-            &err);
+  queue_ = clCreateCommandQueueWithProperties(context_, device_, props, &err);
 
 #else
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
-    queue_ =
-        clCreateCommandQueue(
-            context_,
-            device_,
-            CL_QUEUE_PROFILING_ENABLE,
-            &err);
+  queue_ = clCreateCommandQueue(context_, device_, CL_QUEUE_PROFILING_ENABLE, &err);
 
 #pragma GCC diagnostic pop
 
 #endif
 
-    CL_CHECK(err);
+  CL_CHECK(err);
 }
 
+void SgbmOpenClRunner::allocateBuffers() {
+  cl_int err = CL_SUCCESS;
 
-  void SgbmOpenClRunner::allocateBuffers() {
-    cl_int err = CL_SUCCESS;
+  const size_t rawBytes = numPixels_ * sizeof(uint8_t);
+  const size_t sobelBytes = numPixels_ * sizeof(int16_t);
+  const size_t boundsBytes = numPixels_ * sizeof(cl_short2);
+  const size_t costVolumeBytes = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(int16_t);
+  const size_t aggVolumeBytes = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(uint16_t);  // 16-bit ushort
+  const size_t dispBytes = numPixels_ * sizeof(float);
+  const size_t packedBytes = numPixels_ * sizeof(uint32_t);
 
-    const size_t rawBytes        = numPixels_ * sizeof(uint8_t);
-    const size_t sobelBytes      = numPixels_ * sizeof(int16_t);
-    const size_t boundsBytes     = numPixels_ * sizeof(cl_short2);
-    const size_t costVolumeBytes = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(int16_t);
-    const size_t aggVolumeBytes  = numPixels_ * static_cast<size_t>(numDisparities_) * sizeof(uint16_t);  // 16-bit ushort
-    const size_t dispBytes       = numPixels_ * sizeof(float);
-    const size_t packedBytes     = numPixels_ * sizeof(uint32_t);
+  bufRawL_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, rawBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufRawR_ = clCreateBuffer(context_, CL_MEM_READ_ONLY, rawBytes, nullptr, &err);
+  CL_CHECK(err);
 
-    bufRawL_           = clCreateBuffer(context_, CL_MEM_READ_ONLY,  rawBytes,        nullptr, &err); CL_CHECK(err);
-    bufRawR_           = clCreateBuffer(context_, CL_MEM_READ_ONLY,  rawBytes,        nullptr, &err); CL_CHECK(err);
+  bufSobelL_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, sobelBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufSobelBoundsL_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufRawBoundsL_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes, nullptr, &err);
+  CL_CHECK(err);
 
-    bufSobelL_         = clCreateBuffer(context_, CL_MEM_READ_WRITE, sobelBytes,      nullptr, &err); CL_CHECK(err);
-    bufSobelBoundsL_   = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes,     nullptr, &err); CL_CHECK(err);
-    bufRawBoundsL_     = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes,     nullptr, &err); CL_CHECK(err);
+  bufSobelR_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, sobelBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufSobelBoundsR_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufRawBoundsR_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes, nullptr, &err);
+  CL_CHECK(err);
 
-    bufSobelR_         = clCreateBuffer(context_, CL_MEM_READ_WRITE, sobelBytes,      nullptr, &err); CL_CHECK(err);
-    bufSobelBoundsR_   = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes,     nullptr, &err); CL_CHECK(err);
-    bufRawBoundsR_     = clCreateBuffer(context_, CL_MEM_READ_WRITE, boundsBytes,     nullptr, &err); CL_CHECK(err);
+  bufPixelCost_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err);
+  CL_CHECK(err);
+  // bufBoxTemp_        = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
+  bufCostL_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufAggL_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, aggVolumeBytes, nullptr, &err);
+  CL_CHECK(err);
 
-    bufPixelCost_      = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
-    bufBoxTemp_        = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
-    bufCostL_          = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err); CL_CHECK(err);
-    bufAggL_           = clCreateBuffer(context_, CL_MEM_READ_WRITE, aggVolumeBytes,  nullptr, &err); CL_CHECK(err);
+  bufRightMinPacked_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, packedBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufDispL_ = clCreateBuffer(context_, CL_MEM_WRITE_ONLY, dispBytes, nullptr, &err);
+  CL_CHECK(err);
 
-    bufRightMinPacked_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, packedBytes,     nullptr, &err); CL_CHECK(err);
-    bufDispL_          = clCreateBuffer(context_, CL_MEM_WRITE_ONLY, dispBytes,       nullptr, &err); CL_CHECK(err);
-  }
-
+  bufCostTrans_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, costVolumeBytes, nullptr, &err);
+  CL_CHECK(err);
+  bufAggTrans_ = clCreateBuffer(context_, CL_MEM_READ_WRITE, aggVolumeBytes, nullptr, &err);
+  CL_CHECK(err);
+}
 
 void SgbmOpenClRunner::speckleFilterHost(std::vector<float>& disp, int width, int height, int speckleWindowSize, int speckleRange, float invalidDisparity) {
   if (speckleWindowSize <= 0) return;

@@ -1,12 +1,12 @@
 #include <gtest/gtest.h>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <vector>
 
 #include "sgbm_opencl.h"
@@ -48,15 +48,7 @@ TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
   const int processed = static_cast<int>(leftMats.size());
   ASSERT_GT(processed, 0);
 
-  SgbmOpenClRunner clSgbm(
-      {"../kernels/sgbm_prefilter_gfx1102.cl",
-       "../kernels/sgbm_kernels.cl",
-       "../kernels/sgbm_wta_lrcheck.cl",
-       "../kernels/sgbm_aggregate_dir.cl"
-      },
-      width,
-      height,
-      numDisparities);
+  SgbmOpenClRunner clSgbm({"../kernels/sgbm_prefilter_gfx1102.cl", "../kernels/sgbm_kernels.cl", "../kernels/sgbm_wta_lrcheck.cl", "../kernels/sgbm_aggregate_dir.cl"}, width, height, numDisparities);
 
   ClSgbmParams p;
   p.minDisparity = 0;
@@ -69,7 +61,7 @@ TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
   p.speckleRange = 2;
   p.disp12MaxDiff = 1;
   p.invalidDisparity = -1.0f;
-  p.full8Paths = false;  // 5-path MODE_SGBM (set true for 8-path MODE_HH)
+  p.sgmPaths = 5;
 
   // ─── Pass 1: Standalone OpenCL Throughput Benchmark (Full GPU TDP, Zero CPU Contention) ───
   std::vector<std::vector<float>> clDisparities(processed);
@@ -80,7 +72,6 @@ TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
   for (int w = 0; w < 5; ++w) {
     clSgbm.compute(rawLefts.front(), rawRights.front(), p, clDisparities.front(), clTimings.front());
   }
-
 
   double sumEndToEndMs = 0.0, sumGpuMs = 0.0;
   double sumPfMs = 0.0, sumCostMs = 0.0, sumAggMs = 0.0, sumWtaMs = 0.0, sumSpeckleMs = 0.0;
@@ -99,12 +90,8 @@ TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
   }
 
   // ─── Pass 2: OpenCV Baseline & Disparity Accuracy Verification ──────────────────────────
-  const int ocvMode = p.full8Paths ? cv::StereoSGBM::MODE_HH : cv::StereoSGBM::MODE_SGBM;
-  auto ocvSgbm = cv::StereoSGBM::create(
-      p.minDisparity, numDisparities, p.blockSize,
-      p.P1, p.P2, p.disp12MaxDiff, p.preFilterCap,
-      p.uniquenessRatio, p.speckleWindowSize, p.speckleRange,
-      ocvMode);
+  const int ocvMode = (p.sgmPaths >= 8) ? cv::StereoSGBM::MODE_HH : cv::StereoSGBM::MODE_SGBM;
+  auto ocvSgbm = cv::StereoSGBM::create(p.minDisparity, numDisparities, p.blockSize, p.P1, p.P2, p.disp12MaxDiff, p.preFilterCap, p.uniquenessRatio, p.speckleWindowSize, p.speckleRange, ocvMode);
 
   double sumOcvMs = 0.0, sumMae = 0.0, sumBad3 = 0.0, sumValidRatio = 0.0;
   const int16_t minValid16 = static_cast<int16_t>(p.minDisparity * 16);
@@ -149,26 +136,21 @@ TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
     sumValidRatio += validRatio;
 
     if (i % 10 == 0) {
-      std::cout << "[Frame " << i << "] OpenCL E2E=" << clTimings[i].endToEndMs
-                << " ms (GPU=" << clTimings[i].totalGpuKernelMs << " ms) | OCV=" << ocvMs
-                << " ms | MAE=" << mae << " px | Bad3=" << bad3Pct << "%\n";
+      std::cout << "[Frame " << i << "] OpenCL E2E=" << clTimings[i].endToEndMs << " ms (GPU=" << clTimings[i].totalGpuKernelMs << " ms) | OCV=" << ocvMs << " ms | MAE=" << mae << " px | Bad3=" << bad3Pct << "%\n";
     }
   }
 
   std::cout << "\n=== KITTI 100-Frame Production OpenCL SGBM Summary (n=" << processed << ", "
-            << (p.full8Paths ? "8-path" : "5-path") << ") ===\n"
-            << "OpenCL End-to-End : mean=" << (sumEndToEndMs / processed) << " ms ("
-            << (1000.0 / (sumEndToEndMs / processed)) << " FPS)\n"
+            << "(" << p.sgmPaths << "-path) ===\n"
+            << "OpenCL End-to-End : mean=" << (sumEndToEndMs / processed) << " ms (" << (1000.0 / (sumEndToEndMs / processed)) << " FPS)\n"
             << "OpenCL GPU Kernels: mean=" << (sumGpuMs / processed) << " ms\n"
             << "  [1] Prefilter   : " << (sumPfMs / processed) << " ms\n"
             << "  [2] Cost Volume : " << (sumCostMs / processed) << " ms\n"
             << "  [3] SGM Agg     : " << (sumAggMs / processed) << " ms\n"
             << "  [4] WTA + LR    : " << (sumWtaMs / processed) << " ms\n"
             << "  [5] Host Speckle: " << (sumSpeckleMs / processed) << " ms\n"
-            << "  [6] Upload/Sync : "
-            << ((sumEndToEndMs - sumGpuMs - sumSpeckleMs) / processed) << " ms\n"
-            << "OpenCV CPU        : mean=" << (sumOcvMs / processed) << " ms ("
-            << (1000.0 / (sumOcvMs / processed)) << " FPS)\n"
+            << "  [6] Upload/Sync : " << ((sumEndToEndMs - sumGpuMs - sumSpeckleMs) / processed) << " ms\n"
+            << "OpenCV CPU        : mean=" << (sumOcvMs / processed) << " ms (" << (1000.0 / (sumOcvMs / processed)) << " FPS)\n"
             << "Mean MAE vs OCV   : " << (sumMae / processed) << " px\n"
             << "Mean Bad > 3px    : " << (sumBad3 / processed) << "%\n"
             << "Mean Valid Ratio  : " << (sumValidRatio / processed) << "x OpenCV\n";
