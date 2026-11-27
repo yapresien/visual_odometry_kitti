@@ -1,3 +1,7 @@
+#ifndef OPENCL_TARGET_VERSION
+#define OPENCL_TARGET_VERSION 120
+#endif
+
 #include <CL/cl.h>
 
 #include <array>

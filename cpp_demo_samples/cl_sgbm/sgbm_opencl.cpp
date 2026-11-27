@@ -580,27 +580,69 @@ void SgbmOpenClRunner::compute(
   timings.endToEndMs = std::chrono::duration<double, std::milli>(tSp1 - tWallStart).count();
 }
 
-void SgbmOpenClRunner::initContextAndQueue() {
-  cl_int err = CL_SUCCESS;
-  context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, &err);
-  CL_CHECK(err);
+void SgbmOpenClRunner::initContextAndQueue()
+{
+    cl_int err = CL_SUCCESS;
 
-  // Check OpenCL device version so we use OpenCL 2.0 queue properties when supported
-  // and cleanly fall back to OpenCL 1.2 clCreateCommandQueue on older drivers (e.g., NVIDIA OpenCL 1.2)
-  std::array<char, 128> versionStr{};
-  clGetDeviceInfo(device_, CL_DEVICE_VERSION, versionStr.size(), versionStr.data(), nullptr);
-  const std::string ver(versionStr.data());
+    context_ =
+        clCreateContext(
+            nullptr,
+            1,
+            &device_,
+            nullptr,
+            nullptr,
+            &err);
 
-  if (ver.find("OpenCL 1.") == std::string::npos) {
-    const cl_queue_properties props[] = {CL_QUEUE_PROPERTIES, CL_QUEUE_PROFILING_ENABLE, 0};
-    queue_ = clCreateCommandQueueWithProperties(context_, device_, props, &err);
-  } else {
+    CL_CHECK(err);
+
+#if CL_TARGET_OPENCL_VERSION >= 200
+
+    const cl_queue_properties props[] =
+    {
+        CL_QUEUE_PROPERTIES,
+        CL_QUEUE_PROFILING_ENABLE,
+        0
+    };
+
+    queue_ =
+        clCreateCommandQueueWithProperties(
+            context_,
+            device_,
+            props,
+            &err);
+
+#else
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    queue_ = clCreateCommandQueue(context_, device_, CL_QUEUE_PROFILING_ENABLE, &err);
+
+    queue_ =
+        clCreateCommandQueue(
+            context_,
+            device_,
+            CL_QUEUE_PROFILING_ENABLE,
+            &err);
+
 #pragma GCC diagnostic pop
-  }
-  CL_CHECK(err);
+
+#endif
+
+    CL_CHECK(err);
+}
+
+static std::string KernelLanguageOption()
+{
+#if OPENCL_TARGET_VERSION >= 300
+    return "-cl-std=CL3.0";
+#elif OPENCL_TARGET_VERSION >= 200
+    return "-cl-std=CL2.0";
+#elif OPENCL_TARGET_VERSION >= 120
+    return "-cl-std=CL1.2";
+#elif OPENCL_TARGET_VERSION >= 110
+    return "-cl-std=CL1.1";
+#else
+    return "-cl-std=CL1.0";
+#endif
 }
 
 std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
@@ -662,15 +704,21 @@ void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths)
   program_ = clCreateProgramWithSource(context_, 1, &srcPtr, &srcLen, &err);
   CL_CHECK(err);
 
-  // Target OpenCL C 2.0 on gfx1102 with fast math optimizations
-  const char* buildOpts = "-cl-std=CL2.0 -cl-mad-enable -cl-fast-relaxed-math";
+  std::string buildOpts = KernelLanguageOption();
+
+  buildOpts +=
+      " -cl-mad-enable"
+      " -cl-fast-relaxed-math";
+
   auto cflags = buildCompilerOptions(specs_, tuningConfig_, numDisparities_);  // Generate additional build options based on device specs and tuning
-  if (cflags.size() > 0) {
-    buildOpts = cflags.c_str();
+  if (!cflags.empty())
+  {
+      buildOpts += " ";
+      buildOpts += cflags;
   }
   std::cout << "Building OpenCL program with options: " << buildOpts << std::endl;
 
-  err = clBuildProgram(program_, 1, &device_, buildOpts, nullptr, nullptr);
+  err = clBuildProgram(program_, 1, &device_, buildOpts.c_str(), nullptr, nullptr);
   if (err != CL_SUCCESS) {
     size_t logSize = 0;
     clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
