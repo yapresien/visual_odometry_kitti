@@ -1,0 +1,5 @@
+BasedOnStyle: LLVM
+ColumnLimit: 80
+BinPackArguments: false
+AllowAllArgumentsOnNextLine: false
+AlignAfterOpenBracket: BlockIndent # Optional: use 'Align' to align under the '('

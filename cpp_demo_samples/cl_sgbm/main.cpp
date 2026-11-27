@@ -1,6 +1,6 @@
 #include <iostream>
 #include <vector>
-#include "sgbm_opencl.hpp"
+#include "sgbm_opencl.h"
 
 int main(int argc, char** argv) {
   const int width = 1241;
@@ -25,7 +25,7 @@ int main(int argc, char** argv) {
   std::vector<int16_t> sobelOut;
   std::vector<cl_short2> sobelBoundsOut;
   std::vector<cl_short2> rawBoundsOut;
-  std::vector<int16_t> costOut;
+  std::vector<short> costOut;
 
   // Stage 1: Prefilter + BT bounds warmup & timing
   runner.runPrefilter(rawLeft, preFilterCap, sobelOut, sobelBoundsOut, rawBoundsOut);

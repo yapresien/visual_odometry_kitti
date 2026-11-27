@@ -1,10 +1,10 @@
-
-// ─── Kernel 4A (256-Thread WG, ushort aggIn): Left WTA + Uniqueness + Subpixel ─
+// ─── Kernel 4A: Left WTA + Subpixel + Atomic Right-View Scatter (256-Thread WG) ─
 __attribute__((reqd_work_group_size(SGM_WG_SIZE, WTA_ROWS_PER_WG, 1)))
-__kernel void k_wta_subpixel(
+__kernel void k_wta_subpixel_and_right_scatter(
     __global const ushort* restrict aggIn,
     __global const short* restrict costIn,
     __global float* restrict dispLOut,
+    __global volatile uint* restrict rightMinPacked,  // Initialized to 0xFFFFFFFFu
     const int width,
     const int height,
     const int minDisparity,
@@ -29,15 +29,16 @@ __kernel void k_wta_subpixel(
   int localBestD = -1;
 
   for (int k = 0; k < D_PER_LANE; ++k) {
-    const int d = k * SGM_WG_SIZE + lane;
-    if (d < numDisparities) {
-      const short c = costIn[base + (size_t)d];
-      const ushort a = aggIn[base + (size_t)d];
-      sharedCost[sub][d] = c;
-      sharedAgg[sub][d] = a;
+    const int dIdx = k * SGM_WG_SIZE + lane;
+    if (dIdx < numDisparities) {
+      const short c = costIn[base + (size_t)dIdx];
+      const ushort a = aggIn[base + (size_t)dIdx];
+      sharedCost[sub][dIdx] = c;
+      sharedAgg[sub][dIdx] = a;
+
       if (c != INVALID_COST && (int)a < localBestC) {
         localBestC = (int)a;
-        localBestD = d;
+        localBestD = dIdx;
       }
     }
   }
@@ -97,6 +98,18 @@ __kernel void k_wta_subpixel(
   }
 
   if (lane == 0) {
+    const int dStart = max(0, bestD - 1);
+    const int dEnd = min(numDisparities - 1, bestD + 1);
+    for (int dCand = dStart; dCand <= dEnd; ++dCand) {
+      if (sharedCost[sub][dCand] != INVALID_COST) {
+        const int xr = x - (minDisparity + dCand);
+        if (xr >= 0 && xr < width) {
+          const uint packed = (((uint)sharedAgg[sub][dCand]) << 16) | (uint)dCand;
+          atomic_min(&rightMinPacked[(size_t)y * (size_t)width + (size_t)xr], packed);
+        }
+      }
+    }
+
     float subpixelOffset = 0.0f;
     if (bestD > 0 && bestD < numDisparities - 1 &&
         sharedCost[sub][bestD - 1] != INVALID_COST &&
@@ -113,83 +126,14 @@ __kernel void k_wta_subpixel(
   }
 }
 
-// ─── Kernel 4B (256-Thread WG, ushort aggIn): Shared-Volume Right WTA ─────────
-__attribute__((reqd_work_group_size(SGM_WG_SIZE, WTA_ROWS_PER_WG, 1)))
-__kernel void k_right_wta_and_lr_check(
-    __global const ushort* restrict aggIn,
-    __global const short* restrict costIn,
+// ─── Kernel 4B: Fast LR Consistency Check from Packed Right Minima (~0.1 ms) ───
+__attribute__((reqd_work_group_size(PF_WG_W, PF_WG_H, 1)))
+__kernel void k_lr_check_packed(
+    __global const uint* restrict rightMinPacked,
     __global float* restrict dispLInOut,
-    __global float* restrict dispROut,
     const int width,
     const int height,
     const int minDisparity,
-    const int numDisparities,
-    const int disp12MaxDiff,
-    const float invalidDisparity) {
-  const int lane = get_local_id(0);
-  const int sub = get_local_id(1);
-  const int xr = get_group_id(0) * WTA_ROWS_PER_WG + sub;
-  const int y = get_group_id(1);
-
-  if (xr >= width || y >= height) return;
-
-  __local int minCostBuf[WTA_ROWS_PER_WG][SGM_WG_SIZE];
-  __local int minDispBuf[WTA_ROWS_PER_WG][SGM_WG_SIZE];
-
-  int localBestC = INT_MAX;
-  int localBestD = -1;
-
-  for (int k = 0; k < D_PER_LANE; ++k) {
-    const int dIdx = k * SGM_WG_SIZE + lane;
-    if (dIdx < numDisparities) {
-      const int d = minDisparity + dIdx;
-      const int xl = xr + d;
-      if (xl >= 0 && xl < width) {
-        const size_t idx = ((size_t)y * (size_t)width + (size_t)xl) * (size_t)numDisparities + (size_t)dIdx;
-        if (costIn[idx] != INVALID_COST) {
-          const int a = (int)aggIn[idx];
-          if (a < localBestC) {
-            localBestC = a;
-            localBestD = dIdx;
-          }
-        }
-      }
-    }
-  }
-
-  minCostBuf[sub][lane] = localBestC;
-  minDispBuf[sub][lane] = localBestD;
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
-    if (lane < stride) {
-      const int cOther = minCostBuf[sub][lane + stride];
-      const int dOther = minDispBuf[sub][lane + stride];
-      const int cCurr = minCostBuf[sub][lane];
-      const int dCurr = minDispBuf[sub][lane];
-      if (cOther < cCurr || (cOther == cCurr && dOther >= 0 && (dCurr < 0 || dOther < dCurr))) {
-        minCostBuf[sub][lane] = cOther;
-        minDispBuf[sub][lane] = dOther;
-      }
-    }
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-
-  if (lane == 0) {
-    const int bestD = *minDispBuf[sub];
-    dispROut[(size_t)y * (size_t)width + (size_t)xr] =
-        (bestD >= 0) ? (float)(minDisparity + bestD) : invalidDisparity;
-  }
-}
-
-
-// ─── Kernel 4C: Left-Right Consistency Filter (Matches SgbmCpu::lrCheck) ──────
-__attribute__((reqd_work_group_size(PF_WG_W, PF_WG_H, 1)))
-__kernel void k_lr_check(
-    __global const float* restrict dispR,
-    __global float* restrict dispLInOut,
-    const int width,
-    const int height,
     const int disp12MaxDiff,
     const float invalidDisparity) {
   if (disp12MaxDiff < 0) return;
@@ -209,8 +153,14 @@ __kernel void k_lr_check(
     return;
   }
 
-  const float dR = dispR[(size_t)y * (size_t)width + (size_t)xr];
-  if (dR == invalidDisparity || fabs((float)dLInt - dR) > (float)disp12MaxDiff) {
+  const uint packedR = rightMinPacked[(size_t)y * (size_t)width + (size_t)xr];
+  if (packedR == 0xFFFFFFFFu) {
+    dispLInOut[idxL] = invalidDisparity;
+    return;
+  }
+
+  const int dRInt = minDisparity + (int)(packedR & 0xFFFFu);
+  if (abs(dLInt - dRInt) > disp12MaxDiff) {
     dispLInOut[idxL] = invalidDisparity;
   }
 }

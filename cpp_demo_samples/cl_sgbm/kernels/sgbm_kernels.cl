@@ -1,6 +1,10 @@
-// ─── Kernel 2: Dual Birchfield-Tomasi + BxB Box Cost Volume 
+// ─── Helper Kernel: Fast Compute Clear (Replaces SDMA clEnqueueFillBuffer) ────
+__kernel void k_clear_uint(__global uint* restrict buf, const uint val, const uint count) {
+  const uint idx = get_global_id(0);
+  if (idx < count) buf[idx] = val;
+}
 
-// ─── Kernel 2A: 1x1 Dual Birchfield-Tomasi Pixel Cost (Parameterized WG) ──────
+// ─── Kernel 2A (16-bit ushort): 1x1 Dual Birchfield-Tomasi Pixel Cost ─────────
 __attribute__((reqd_work_group_size(COST_WG_W, COST_WG_H, 1)))
 __kernel void k_bt_pixel_cost(
     __global const uchar* restrict rawL,
@@ -47,7 +51,6 @@ __kernel void k_bt_pixel_cost(
     }
 
     const int idxR = y * width + xr;
-
     const int sR = (int)sobelR[idxR];
     const short2 sBR = sobelBoundsR[idxR];
     const int btSobel = min(
@@ -64,7 +67,7 @@ __kernel void k_bt_pixel_cost(
   }
 }
 
-// ─── Kernel 2B: BxB Box Sum over Pixel Cost Volume (Parameterized WG) ────────
+// ─── Kernel 2B (16-bit short): BxB Box Sum over Pixel Cost Volume ────────────
 __attribute__((reqd_work_group_size(COST_WG_W, COST_WG_H, 1)))
 __kernel void k_box_filter_cost(
     __global const ushort* restrict pixelCostIn,
@@ -85,7 +88,7 @@ __kernel void k_box_filter_cost(
 
   if (y < B2 || y >= height - B2 || x < B2 + 1 || x >= width - B2 - 1) {
     for (int dIdx = lane; dIdx < numDisparities; dIdx += COST_WG_W) {
-      costOut[baseOut + (size_t)dIdx] = INVALID_COST;
+      costOut[baseOut + (size_t)dIdx] = (short)INVALID_COST;
     }
     return;
   }
@@ -95,7 +98,7 @@ __kernel void k_box_filter_cost(
     const int xr = x - d;
 
     if (xr - B2 < 1 || xr + B2 >= width - 1) {
-      costOut[baseOut + (size_t)dIdx] = INVALID_COST;
+      costOut[baseOut + (size_t)dIdx] = (short)INVALID_COST;
       continue;
     }
 

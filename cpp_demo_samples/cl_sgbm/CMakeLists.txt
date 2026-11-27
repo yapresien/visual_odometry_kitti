@@ -7,6 +7,7 @@ set(CMAKE_BUILD_TYPE Release)
 find_package(OpenCV REQUIRED)
 find_package(OpenCL REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS}
+${CMAKE_CURRENT_SOURCE_DIR}
 /usr/include)
 
 
@@ -25,15 +26,18 @@ find_package(Threads REQUIRED)
 #target_compile_options(helper_sgbm PRIVATE -O3 -march=native -DNDEBUG)
 
 
-add_executable(sgbm_opencl sgbm_opencl.hpp main.cpp)
+add_executable(sgbm_opencl sgbm_opencl.cpp main.cpp)
 target_link_libraries(sgbm_opencl PRIVATE OpenCL::OpenCL ${OpenCV_LIBS} Threads::Threads)
-target_compile_options(sgbm_opencl PRIVATE -O0 -g)
 
 # target_compile_definitions(sgbm_opencl PRIVATE UNIT_TESTS)
 
-add_executable(sgbm_opencl_gtest sgbm_opencl.hpp test_opencl_kitti_100frames.cpp)
+add_executable(sgbm_opencl_gtest sgbm_opencl.cpp test_opencl_kitti_100frames.cpp)
 target_link_libraries(sgbm_opencl_gtest PRIVATE OpenCL::OpenCL GTest::gtest_main ${OpenCV_LIBS} Threads::Threads)
 target_compile_definitions(sgbm_opencl_gtest PRIVATE UNIT_TESTS)
+
+target_compile_options(sgbm_opencl PRIVATE -O3 -march=native -DNDEBUG)
+target_compile_options(sgbm_opencl_gtest PRIVATE -O3 -march=native -DNDEBUG)
+
 
 include(GoogleTest)
 gtest_discover_tests(sgbm_opencl_gtest)

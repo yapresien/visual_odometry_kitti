@@ -137,3 +137,183 @@ __kernel void k_sgm_aggregate_dir(
     barrier(CLK_LOCAL_MEM_FENCE);
   }
 }
+
+// ─── Kernel 3 (4-Pass Bidirectional, 256-Thread WG): SGM Axis Aggregation ────
+// Packs SGM_ROWS_PER_WG (8) scanlines per 256-thread WG (100% CU occupancy on gfx1102)
+// and sweeps BOTH forward (+dx, +dy) and backward (-dx, -dy) in a single pass!
+__attribute__((reqd_work_group_size(SGM_WG_SIZE, WTA_ROWS_PER_WG, 1)))
+__kernel void k_sgm_bidi_axis(
+    __global const short* restrict costIn,
+    __global ushort* restrict aggOut,
+    const int width,
+    const int height,
+    const int numDisparities,
+    const int P1,
+    const int P2,
+    const int dx,
+    const int dy,
+    const int isFirstAxis,
+    const int doBackwardPass) {
+  const int lane = get_local_id(0);
+  const int sub = get_local_id(1);
+  const int scanId = get_group_id(0) * WTA_ROWS_PER_WG + sub;
+
+  int x0 = 0, y0 = 0, steps = 0;
+  if (dy == 0) {
+    if (scanId >= height) return;
+    y0 = scanId; x0 = 0; steps = width;
+  } else if (dx == 0) {
+    if (scanId >= width) return;
+    x0 = scanId; y0 = 0; steps = height;
+  } else if (dx > 0 && dy > 0) {
+    if (scanId >= width + height - 1) return;
+    x0 = (scanId < height) ? 0 : (scanId - height + 1);
+    y0 = (scanId < height) ? (height - 1 - scanId) : 0;
+    steps = min(width - x0, height - y0);
+  } else {
+    // dx < 0 && dy > 0 (TR -> BL and reverse BL -> TR)
+    if (scanId >= width + height - 1) return;
+    x0 = (scanId < width) ? scanId : (width - 1);
+    y0 = (scanId < width) ? 0 : (scanId - width + 1);
+    steps = min(x0 + 1, height - y0);
+  }
+
+  __local int sharedLPrev[WTA_ROWS_PER_WG][NUM_DISPARITIES + 2];
+  __local int sharedMin[WTA_ROWS_PER_WG][SGM_WG_SIZE];
+
+  if (lane == 0) {
+    *sharedLPrev[sub] = MAX_PATH_INT;
+    sharedLPrev[sub][numDisparities + 1] = MAX_PATH_INT;
+  }
+
+  // ── Forward Sweep: (x0, y0) + s * (dx, dy) ──
+  int lPrev[D_PER_LANE];
+  for (int k = 0; k < D_PER_LANE; ++k) lPrev[k] = MAX_PATH_INT;
+  bool prevValid = false;
+
+  int x = x0, y = y0;
+  for (int s = 0; s < steps; ++s, x += dx, y += dy) {
+    const size_t baseIdx = ((size_t)y * (size_t)width + (size_t)x) * (size_t)numDisparities;
+    int cVal[D_PER_LANE];
+    int laneMinPrev = MAX_PATH_INT;
+    bool hasAnyValid = false;
+
+    for (int k = 0; k < D_PER_LANE; ++k) {
+      const int d = k * SGM_WG_SIZE + lane;
+      if (d < numDisparities) {
+        const short c = costIn[baseIdx + (size_t)d];
+        cVal[k] = (int)c;
+        if (c != INVALID_COST) hasAnyValid = true;
+        sharedLPrev[sub][d + 1] = lPrev[k];
+        laneMinPrev = min(laneMinPrev, lPrev[k]);
+      }
+    }
+
+    sharedMin[sub][lane] = laneMinPrev;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
+      if (lane < stride) sharedMin[sub][lane] = min(sharedMin[sub][lane], sharedMin[sub][lane + stride]);
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const int minPrev = *sharedMin[sub];
+
+    sharedMin[sub][lane] = hasAnyValid ? 1 : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
+      if (lane < stride) sharedMin[sub][lane] |= sharedMin[sub][lane + stride];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const bool currHasValid = (*sharedMin[sub] != 0);
+
+    for (int k = 0; k < D_PER_LANE; ++k) {
+      const int d = k * SGM_WG_SIZE + lane;
+      if (d >= numDisparities) break;
+      const int c = cVal[k];
+      int lCurr = MAX_PATH_INT;
+      if (c != INVALID_COST) {
+        if (!prevValid || minPrev >= MAX_PATH_INT) {
+          lCurr = c;
+        } else {
+          const int best = min(
+              min(sharedLPrev[sub][d + 1], sharedLPrev[sub][d] + P1),
+              min(sharedLPrev[sub][d + 2] + P1, minPrev + P2));
+          lCurr = c + best - minPrev;
+        }
+      }
+      lPrev[k] = lCurr;
+      const int addVal = (c != INVALID_COST) ? lCurr : 0;
+      if (isFirstAxis) {
+        aggOut[baseIdx + (size_t)d] = convert_ushort_sat(addVal);
+      } else {
+        aggOut[baseIdx + (size_t)d] = convert_ushort_sat((int)aggOut[baseIdx + (size_t)d] + addVal);
+      }
+    }
+    prevValid = currHasValid;
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+
+  if (!doBackwardPass) return;
+
+  // ── Backward Sweep: reverse from end pixel back to (x0, y0) ──
+  for (int k = 0; k < D_PER_LANE; ++k) lPrev[k] = MAX_PATH_INT;
+  prevValid = false;
+
+  x -= dx;
+  y -= dy;
+  for (int s = 0; s < steps; ++s, x -= dx, y -= dy) {
+    const size_t baseIdx = ((size_t)y * (size_t)width + (size_t)x) * (size_t)numDisparities;
+    int cVal[D_PER_LANE];
+    int laneMinPrev = MAX_PATH_INT;
+    bool hasAnyValid = false;
+
+    for (int k = 0; k < D_PER_LANE; ++k) {
+      const int d = k * SGM_WG_SIZE + lane;
+      if (d < numDisparities) {
+        const short c = costIn[baseIdx + (size_t)d];
+        cVal[k] = (int)c;
+        if (c != INVALID_COST) hasAnyValid = true;
+        sharedLPrev[sub][d + 1] = lPrev[k];
+        laneMinPrev = min(laneMinPrev, lPrev[k]);
+      }
+    }
+
+    sharedMin[sub][lane] = laneMinPrev;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
+      if (lane < stride) sharedMin[sub][lane] = min(sharedMin[sub][lane], sharedMin[sub][lane + stride]);
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const int minPrev = *sharedMin[sub];
+
+    sharedMin[sub][lane] = hasAnyValid ? 1 : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int stride = (SGM_WG_SIZE >> 1); stride > 0; stride >>= 1) {
+      if (lane < stride) sharedMin[sub][lane] |= sharedMin[sub][lane + stride];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const bool currHasValid = (*sharedMin[sub] != 0);
+
+    for (int k = 0; k < D_PER_LANE; ++k) {
+      const int d = k * SGM_WG_SIZE + lane;
+      if (d >= numDisparities) break;
+      const int c = cVal[k];
+      int lCurr = MAX_PATH_INT;
+      if (c != INVALID_COST) {
+        if (!prevValid || minPrev >= MAX_PATH_INT) {
+          lCurr = c;
+        } else {
+          const int best = min(
+              min(sharedLPrev[sub][d + 1], sharedLPrev[sub][d] + P1),
+              min(sharedLPrev[sub][d + 2] + P1, minPrev + P2));
+          lCurr = c + best - minPrev;
+        }
+      }
+      lPrev[k] = lCurr;
+      if (c != INVALID_COST) {
+        aggOut[baseIdx + (size_t)d] = convert_ushort_sat((int)aggOut[baseIdx + (size_t)d] + lCurr);
+      }
+    }
+    prevValid = currHasValid;
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
