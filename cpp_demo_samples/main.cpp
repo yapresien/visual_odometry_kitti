@@ -212,7 +212,7 @@ int main(int argc, char** argv) {
     int h = prev_l_mat.rows, w = prev_l_mat.cols;
 
     // ── Stereo matcher (OpenCL SGBM when --no-ocl is not set, CPU fallback) ─
-    std::unique_ptr<SgbmOpenClRunner> cl_sgbm;
+    std::unique_ptr<OpenClSgbm> cl_sgbm;
     ClSgbmParams cl_params;
     cl_params.minDisparity = 0;
     cl_params.blockSize = BLOCK_SIZE;
@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
     
     cv::Ptr<cv::StereoSGBM> cpu_sgbm;
     if (useOcl && cv::ocl::haveOpenCL()) {
-        cl_sgbm = std::make_unique<SgbmOpenClRunner>(
+        cl_sgbm = std::make_unique<OpenClSgbm>(
             std::vector<std::string>{"/home/master/myspace/projects/visual_odometry_kitti/cpp_demo_samples/cl_sgbm/kernels/sgbm.cl"},  // Update path if needed
            w / dsFactor, h / dsFactor, NUM_DISP / dsFactor);
     } else {

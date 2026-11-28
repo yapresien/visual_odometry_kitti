@@ -9,7 +9,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <vector>
 
-#include "sgbm_opencl.h"
+#include "opencl_sgbm.h"
 
 TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
   const std::string seqDir = "/home/master/myspace/projects/dataset_kitti/sequences/00";
@@ -48,7 +48,7 @@ TEST(OpenClSgbmBenchmark, First100KittiFramesVsOpenCv) {
   const int processed = static_cast<int>(leftMats.size());
   ASSERT_GT(processed, 0);
 
-  SgbmOpenClRunner clSgbm({"../kernels/sgbm_prefilter_gfx1102.cl", "../kernels/sgbm_kernels.cl", "../kernels/sgbm_wta_lrcheck.cl", "../kernels/sgbm_aggregate_dir.cl"}, width, height, numDisparities);
+  OpenClSgbm clSgbm( width, height, numDisparities);
 
   ClSgbmParams p;
   p.minDisparity = 0;

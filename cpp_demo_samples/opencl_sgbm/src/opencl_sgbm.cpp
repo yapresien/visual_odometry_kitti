@@ -1,5 +1,6 @@
 
-#include "sgbm_opencl.h"
+#include "opencl_sgbm/opencl_sgbm.h"
+#include "opencl_sgbm/binary_cache.h"
 
 #include <cassert>
 #include <chrono>
@@ -31,9 +32,32 @@ static std::string KernelLanguageOption() {
   return "-cl-std=CL1.0";
 #endif
 }
+OpenClSgbm::OpenClSgbm( int width, int height, int numDisparities, const TuningConfig& tuning) 
+  : width_(width), height_(height), numDisparities_(numDisparities), 
+  numPixels_(static_cast<size_t>(width) * height), 
+  tuningConfig_(tuning) {
+  
+    if (width_ <= 0 || height_ <= 0 || numDisparities_ <= 0) {
+    throw std::invalid_argument("Invalid image dimensions or numDisparities");
+  }
 
-SgbmOpenClRunner::SgbmOpenClRunner(const std::vector<std::string>& clFilePaths, int width, int height, int numDisparities, const TuningConfig& tuning) : clFilePaths_(clFilePaths), width_(width), height_(height), numDisparities_(numDisparities), numPixels_(static_cast<size_t>(width) * height), tuningConfig_(tuning) {
-  if (width_ <= 0 || height_ <= 0 || numDisparities_ <= 0) {
+  auto devices = selectDevice(tuningConfig_.preferredVendor);
+  device_ = devices.empty() ? nullptr : devices[0];
+  assert(device_ != nullptr);
+  specs_ = queryAndTuneDevice(device_, tuningConfig_);
+  initContextAndQueue();
+  buildProgram({OPENCL_SGBM_DEFAULT_KERNEL_PATH});
+  refineWarpWidthFromKernel();  // Queries CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE & rebuilds if needed
+  allocateBuffers();
+}
+
+OpenClSgbm::OpenClSgbm(const std::vector<std::string>& clFilePaths, int width, int height, int numDisparities, const TuningConfig& tuning) 
+  : clFilePaths_(clFilePaths), width_(width), height_(height), 
+  numDisparities_(numDisparities), 
+  numPixels_(static_cast<size_t>(width) * height), 
+  tuningConfig_(tuning) {
+  
+    if (width_ <= 0 || height_ <= 0 || numDisparities_ <= 0) {
     throw std::invalid_argument("Invalid image dimensions or numDisparities");
   }
 
@@ -47,7 +71,7 @@ SgbmOpenClRunner::SgbmOpenClRunner(const std::vector<std::string>& clFilePaths, 
   allocateBuffers();
 }
 
-SgbmOpenClRunner::~SgbmOpenClRunner() {
+OpenClSgbm::~OpenClSgbm() {
   if (bufRawL_) clReleaseMemObject(bufRawL_);
   if (bufSobelL_) clReleaseMemObject(bufSobelL_);
   if (bufSobelBoundsL_) clReleaseMemObject(bufSobelBoundsL_);
@@ -67,7 +91,7 @@ SgbmOpenClRunner::~SgbmOpenClRunner() {
   if (context_) clReleaseContext(context_);
 }
 
-std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& preferredVendor) {
+std::vector<cl_device_id> OpenClSgbm::selectDevice(const std::string& preferredVendor) {
   cl_uint numPlatforms = 0;
   CL_CHECK(clGetPlatformIDs(0, nullptr, &numPlatforms));
   if (numPlatforms == 0) throw std::runtime_error("No OpenCL platforms found");
@@ -105,7 +129,7 @@ std::vector<cl_device_id> SgbmOpenClRunner::selectDevice(const std::string& pref
   return {fallbackGpu};
 }
 
-std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
+std::string OpenClSgbm::detectOpenClCStandard(cl_device_id device) {
   std::array<char, 256> ver{};
   clGetDeviceInfo(device, CL_DEVICE_OPENCL_C_VERSION, ver.size(), ver.data(), nullptr);
   const std::string v(ver.data());
@@ -117,7 +141,7 @@ std::string SgbmOpenClRunner::detectOpenClCStandard(cl_device_id device) {
   return "-cl-std=CL1.2";
 }
 
-std::string SgbmOpenClRunner::buildCompilerOptions(const DeviceSpecs& specs, const TuningConfig& cfg, int numDisparities) {
+std::string OpenClSgbm::buildCompilerOptions(const DeviceSpecs& specs, const TuningConfig& cfg, int numDisparities) {
   const int apron = 2;
   const int pfTileW = static_cast<int>(specs.pfWgW) + 2 * apron;
   const int pfTileH = static_cast<int>(specs.pfWgH) + 2 * apron;
@@ -146,75 +170,66 @@ std::string SgbmOpenClRunner::buildCompilerOptions(const DeviceSpecs& specs, con
        << "-D INVALID_COST=32767 ";
   return opts.str();
 }
-
-void SgbmOpenClRunner::buildProgram(const std::vector<std::string>& clFilePaths) {
-  std::vector<std::string> srcStrings;
-  std::string result;
+void OpenClSgbm::buildProgram(const std::vector<std::string>& clFilePaths) {
+  std::string kernelSource;
   for (const auto& clFilePath : clFilePaths) {
     std::ifstream file(clFilePath);
-    if (!file.is_open()) throw std::runtime_error("Failed to open kernel file: " + clFilePath);
+    if (!file.is_open()) {
+      throw std::runtime_error("Failed to open kernel file: " + clFilePath);
+    }
     std::stringstream ss;
     ss << file.rdbuf();
-    srcStrings.push_back(ss.str());
-    result += srcStrings.back();
+    kernelSource += ss.str();
+    kernelSource += "\n";
   }
 
-  const std::string srcStr = result;
-  const char* srcPtr = srcStr.c_str();
-  const size_t srcLen = srcStr.size();
-
-  cl_int err = CL_SUCCESS;
-  program_ = clCreateProgramWithSource(context_, 1, &srcPtr, &srcLen, &err);
-  CL_CHECK(err);
-
   std::string buildOpts = KernelLanguageOption();
-
-  auto cflags = buildCompilerOptions(specs_, tuningConfig_, numDisparities_);  // Generate additional build options based on device specs and tuning
+  const auto cflags = buildCompilerOptions(specs_, tuningConfig_, numDisparities_);
   if (!cflags.empty()) {
     buildOpts += " ";
     buildOpts += cflags;
   }
-  std::cout << "Building OpenCL program with options: " << buildOpts << std::endl;
 
-  err = clBuildProgram(program_, 1, &device_, buildOpts.c_str(), nullptr, nullptr);
-  if (err != CL_SUCCESS) {
-    size_t logSize = 0;
-    clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
-    std::string buildLog(logSize, '\0');
-    clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, logSize, buildLog.data(), nullptr);
-    std::cerr << "OpenCL Build Log:\n" << buildLog << "\n";
+  // Query driver version for persistent ISA cache key
+  std::array<char, 256> driverBuf{};
+  clGetDeviceInfo(device_, CL_DEVICE_VERSION, driverBuf.size(), driverBuf.data(), nullptr);
+  const auto hostInfo = opencl_sgbm::detectHostPlatform();
+  const std::string cachePath = opencl_sgbm::buildCacheKeyPath(
+      hostInfo, specs_.deviceName, driverBuf.data(), buildOpts, kernelSource);
+
+  cl_int err = CL_SUCCESS;
+  if (!opencl_sgbm::loadProgramBinary(context_, device_, cachePath, buildOpts, program_)) {
+    std::cout << "Compiling OpenCL kernels for target (" << specs_.deviceName << ")...\n";
+    const char* srcPtr = kernelSource.c_str();
+    const size_t srcLen = kernelSource.size();
+    program_ = clCreateProgramWithSource(context_, 1, &srcPtr, &srcLen, &err);
     CL_CHECK(err);
+
+    err = clBuildProgram(program_, 1, &device_, buildOpts.c_str(), nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+      size_t logSize = 0;
+      clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+      std::string buildLog(logSize, '\0');
+      clGetProgramBuildInfo(program_, device_, CL_PROGRAM_BUILD_LOG, logSize, buildLog.data(), nullptr);
+      std::cerr << "OpenCL Build Log:\n" << buildLog << "\n";
+      CL_CHECK(err);
+    }
+    opencl_sgbm::saveProgramBinary(program_, cachePath);
   }
 
-  // Stage 1 kernels: Prefilter + BT bounds
-  kernelClearUint_ = clCreateKernel(program_, "k_clear_uint", &err);
-  CL_CHECK(err);
-
-  kernelPrefilter_ = clCreateKernel(program_, "k_prefilter_and_bt_bounds", &err);
-  CL_CHECK(err);
-
-  // Stage 2 kernels: BT pixel cost + box filter cost
-  kernelBtBoxFused_ = clCreateKernel(program_, "k_bt_box_fused", &err);
-  CL_CHECK(err);
-  kernelDownsample2x_ = clCreateKernel(program_, "k_downsample_2x", &err);
-  CL_CHECK(err);
-  kernelUpsample2x_ = clCreateKernel(program_, "k_upsample_disp_2x", &err);
-  CL_CHECK(err);
-
-  // Stage 3 kernels: 4-pass bidirectional SGM aggregation
-  kernelAggDir_ = clCreateKernel(program_, "k_sgm_aggregate_dir", &err);
-  CL_CHECK(err);
-
-  // Stage 4 kernels: WTA + Right scatter + LR check
-  kernelLrCheck_ = clCreateKernel(program_, "k_lr_check_packed", &err);
-  CL_CHECK(err);
-  kernelAggBidiAxis_ = clCreateKernel(program_, "k_sgm_bidi_axis", &err);
-  CL_CHECK(err);
-  kernelWtaScatter_ = clCreateKernel(program_, "k_wta_subpixel_and_right_scatter", &err);
-  CL_CHECK(err);
+  // Create kernels
+  kernelClearUint_    = clCreateKernel(program_, "k_clear_uint", &err);                     CL_CHECK(err);
+  kernelPrefilter_    = clCreateKernel(program_, "k_prefilter_and_bt_bounds", &err);        CL_CHECK(err);
+  kernelBtBoxFused_   = clCreateKernel(program_, "k_bt_box_fused", &err);                   CL_CHECK(err);
+  kernelDownsample2x_ = clCreateKernel(program_, "k_downsample_2x", &err);                  CL_CHECK(err);
+  kernelUpsample2x_   = clCreateKernel(program_, "k_upsample_disp_2x", &err);               CL_CHECK(err);
+  kernelAggBidiAxis_  = clCreateKernel(program_, "k_sgm_bidi_axis", &err);                  CL_CHECK(err);
+  kernelWtaScatter_   = clCreateKernel(program_, "k_wta_subpixel_and_right_scatter", &err); CL_CHECK(err);
+  kernelLrCheck_      = clCreateKernel(program_, "k_lr_check_packed", &err);                CL_CHECK(err);
 }
 
-void SgbmOpenClRunner::refineWarpWidthFromKernel() {
+
+void OpenClSgbm::refineWarpWidthFromKernel() {
   if (tuningConfig_.overrideWarpWidth > 0) return;  // User explicitly forced a warp width
 
   size_t hwWarpWidth = 0;
@@ -234,7 +249,7 @@ void SgbmOpenClRunner::refineWarpWidthFromKernel() {
   }
 }
 
-DeviceSpecs SgbmOpenClRunner::queryAndTuneDevice(cl_device_id device, const TuningConfig& cfg) {
+DeviceSpecs OpenClSgbm::queryAndTuneDevice(cl_device_id device, const TuningConfig& cfg) {
   DeviceSpecs specs;
   char nameBuf[256] = {0};
   clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(nameBuf), nameBuf, nullptr);
@@ -261,7 +276,7 @@ DeviceSpecs SgbmOpenClRunner::queryAndTuneDevice(cl_device_id device, const Tuni
   return specs;
 }
 
-double SgbmOpenClRunner::runPrefilter(const std::vector<uint8_t>& rawLeft, int preFilterCap, std::vector<int16_t>& sobelOut, std::vector<cl_short2>& sobelBoundsOut, std::vector<cl_short2>& rawBoundsOut) {
+double OpenClSgbm::runPrefilter(const std::vector<uint8_t>& rawLeft, int preFilterCap, std::vector<int16_t>& sobelOut, std::vector<cl_short2>& sobelBoundsOut, std::vector<cl_short2>& rawBoundsOut) {
   cl_int err = CL_SUCCESS;
 
   // 1. Zero-copy map input buffer into host address space (Radeon 890M unified memory)
@@ -320,7 +335,7 @@ double SgbmOpenClRunner::runPrefilter(const std::vector<uint8_t>& rawLeft, int p
   return kernelMs;
 }
 
-double SgbmOpenClRunner::runBoxCost(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, int preFilterCap, int minDisparity, int blockSize, std::vector<short>& costOut) {
+double OpenClSgbm::runBoxCost(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, int preFilterCap, int minDisparity, int blockSize, std::vector<short>& costOut) {
   // 1. Non-blocking upload of Left and Right raw images (hardware-agnostic)
   CL_CHECK(clEnqueueWriteBuffer(queue_, bufRawL_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawLeft.data(), 0, nullptr, nullptr));
   CL_CHECK(clEnqueueWriteBuffer(queue_, bufRawR_, CL_FALSE, 0, numPixels_ * sizeof(uint8_t), rawRight.data(), 0, nullptr, nullptr));
@@ -381,7 +396,7 @@ double SgbmOpenClRunner::runBoxCost(const std::vector<uint8_t>& rawLeft, const s
   return static_cast<double>(t1 - t0) * 1e-6;
 }
 
-double SgbmOpenClRunner::runAggregate(int P1, int P2, std::vector<uint16_t>& aggOut) {
+double OpenClSgbm::runAggregate(int P1, int P2, std::vector<uint16_t>& aggOut) {
   struct Dir {
     int dx;
     int dy;
@@ -433,13 +448,13 @@ double SgbmOpenClRunner::runAggregate(int P1, int P2, std::vector<uint16_t>& agg
   return totalAggMs;
 }
 
-double SgbmOpenClRunner::runDisparitySelection(const ClSgbmParams& p, std::vector<float>& dispLOut) {
+double OpenClSgbm::runDisparitySelection(const ClSgbmParams& p, std::vector<float>& dispLOut) {
   // 4A. Left WTA + non-adjacent uniqueness + parabolic sub-pixel
 
-  const std::array<size_t, 2> wtaLocal = {specs_.sgmWgSize, 1};
-  const std::array<size_t, 2> wtaGlobal = {static_cast<size_t>(width_) * specs_.sgmWgSize, static_cast<size_t>(height_)};
+  // const std::array<size_t, 2> wtaLocal = {specs_.sgmWgSize, 1};
+  // const std::array<size_t, 2> wtaGlobal = {static_cast<size_t>(width_) * specs_.sgmWgSize, static_cast<size_t>(height_)};
 
-  cl_event evWtaL = nullptr;
+  //cl_event evWtaL = nullptr;
 
   // 4C. Integer Left-Right consistency check
   CL_CHECK(clSetKernelArg(kernelLrCheck_, 0, sizeof(cl_mem), &bufRightMinPacked_));
@@ -483,7 +498,7 @@ double SgbmOpenClRunner::runDisparitySelection(const ClSgbmParams& p, std::vecto
   return wtaLrMs;
 }
 
-void SgbmOpenClRunner::compute(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, const ClSgbmParams& p, std::vector<float>& dispLOut, ClSgbmTimings& timings) {
+void OpenClSgbm::compute(const std::vector<uint8_t>& rawLeft, const std::vector<uint8_t>& rawRight, const ClSgbmParams& p, std::vector<float>& dispLOut, ClSgbmTimings& timings) {
   const auto tWallStart = std::chrono::steady_clock::now();
 
   auto eventMs = [](cl_event ev) {
@@ -688,7 +703,7 @@ void SgbmOpenClRunner::compute(const std::vector<uint8_t>& rawLeft, const std::v
   timings.endToEndMs = std::chrono::duration<double, std::milli>(tSp1 - tWallStart).count();
 }
 
-void SgbmOpenClRunner::initContextAndQueue() {
+void OpenClSgbm::initContextAndQueue() {
   cl_int err = CL_SUCCESS;
 
   context_ = clCreateContext(nullptr, 1, &device_, nullptr, nullptr, &err);
@@ -715,7 +730,7 @@ void SgbmOpenClRunner::initContextAndQueue() {
   CL_CHECK(err);
 }
 
-void SgbmOpenClRunner::allocateBuffers() {
+void OpenClSgbm::allocateBuffers() {
   cl_int err = CL_SUCCESS;
 
   const size_t rawBytes = numPixels_ * sizeof(uint8_t);
@@ -766,7 +781,7 @@ void SgbmOpenClRunner::allocateBuffers() {
   CL_CHECK(err);
 }
 
-void SgbmOpenClRunner::speckleFilterHost(std::vector<float>& disp, int width, int height, int speckleWindowSize, int speckleRange, float invalidDisparity) {
+void OpenClSgbm::speckleFilterHost(std::vector<float>& disp, int width, int height, int speckleWindowSize, int speckleRange, float invalidDisparity) {
   if (speckleWindowSize <= 0) return;
 
   const float maxDiff = static_cast<float>(speckleRange);

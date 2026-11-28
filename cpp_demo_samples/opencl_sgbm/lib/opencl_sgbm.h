@@ -1,7 +1,21 @@
+// =============================================================================
+// Project     : opencl_sgbm — Hardware-Agnostic OpenCL Semi-Global Block Matching
+// File        : opencl_sgbm.h
+// Author      : <Anshul Yadav> <<er.anshulyadav@gmail.com>>
+// Created     : 2026-11-28
+// License     : MIT / Apache-2.0 (SPDX-License-Identifier: MIT)
+// Description : Self-tuning OpenCL 1.2 SGBM stereo matching library portable
+//               across AMD APUs/dGPUs, NVIDIA CUDA/Jetson, and Intel GPUs.
+// =============================================================================
+
 #pragma once
 
 #ifndef OPENCL_TARGET_VERSION
 #define OPENCL_TARGET_VERSION 120
+#endif
+
+#ifndef OPENCL_SGBM_DEFAULT_KERNEL_PATH
+#define OPENCL_SGBM_DEFAULT_KERNEL_PATH "kernels/opencl_sgbm.cl"
 #endif
 
 #include <CL/cl.h>
@@ -62,19 +76,30 @@ struct ClSgbmParams {
   int downsampleFactor = 1;
 };
 
-class SgbmOpenClRunner {
+
+class OpenClSgbm {
  public:
-  SgbmOpenClRunner(
-      const std::vector<std::string>& clFilePaths,
+  // Zero-path constructor: automatically loads OPENCL_SGBM_DEFAULT_KERNEL_PATH
+  // (with automatic fallback to "./kernels/opencl_sgbm.cl" for uninstalled local runs)
+  OpenClSgbm(
       int width,
       int height,
       int numDisparities,
       const TuningConfig& tuning = TuningConfig{});
 
-  ~SgbmOpenClRunner();
+  // Explicit single-file .cl path constructor
+  OpenClSgbm(
+      const std::vector<std::string>& clKernelPath,
+      int width,
+      int height,
+      int numDisparities,
+      const TuningConfig& tuning = TuningConfig{});
 
-  SgbmOpenClRunner(const SgbmOpenClRunner&) = delete;
-  SgbmOpenClRunner& operator=(const SgbmOpenClRunner&) = delete;
+
+  ~OpenClSgbm();
+
+  OpenClSgbm(const OpenClSgbm&) = delete;
+  OpenClSgbm& operator=(const OpenClSgbm&) = delete;
 
   const DeviceSpecs& deviceSpecs() const noexcept { return specs_; }
 
@@ -169,7 +194,7 @@ class SgbmOpenClRunner {
   std::vector<std::pair<int, int>> speckleStack_;
   std::vector<std::pair<int, int>> speckleComponent_;
 
-    cl_kernel kernelDownsample2x_ = nullptr;
+  cl_kernel kernelDownsample2x_ = nullptr;
   cl_kernel kernelUpsample2x_ = nullptr;
   cl_mem bufFullRawL_ = nullptr;
   cl_mem bufFullRawR_ = nullptr;
